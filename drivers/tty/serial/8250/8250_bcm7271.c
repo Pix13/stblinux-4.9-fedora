@@ -88,7 +88,7 @@ struct brcmuart_priv {
 	u32		rx_bad_timeout_late_char;
 	u32		rx_bad_timeout_no_char;
 	u32		rx_missing_close_timeout;
-
+	u32		saved_mctrl;
 };
 
 /*
@@ -1084,9 +1084,18 @@ static int brcmuart_remove(struct platform_device *pdev)
 static int __maybe_unused brcmuart_suspend(struct device *dev)
 {
 	struct brcmuart_priv *priv = dev_get_drvdata(dev);
+	struct uart_8250_port *up = serial8250_get_port(priv->line);
+	struct uart_port *port = &up->port;
 
 	serial8250_suspend_port(priv->line);
 	clk_disable_unprepare(priv->baud_mux_clk);
+
+	/*
+	 * This will prevent resume from enabling RTS before the
+	 *  baud rate has been resored.
+	 */
+	priv->saved_mctrl = port->mctrl;
+	port->mctrl = 0;
 
 	return 0;
 }
@@ -1094,6 +1103,8 @@ static int __maybe_unused brcmuart_suspend(struct device *dev)
 static int __maybe_unused brcmuart_resume(struct device *dev)
 {
 	struct brcmuart_priv *priv = dev_get_drvdata(dev);
+	struct uart_8250_port *up = serial8250_get_port(priv->line);
+	struct uart_port *port = &up->port;
 	int ret;
 
 	ret = clk_prepare_enable(priv->baud_mux_clk);
@@ -1113,6 +1124,7 @@ static int __maybe_unused brcmuart_resume(struct device *dev)
 		start_rx_dma(serial8250_get_port(priv->line));
 	}
 	serial8250_resume_port(priv->line);
+	port->mctrl = priv->saved_mctrl;
 	return 0;
 }
 

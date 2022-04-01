@@ -14,6 +14,7 @@
 #define PHY_ID_BCMAC131			0x0143bc70
 #define PHY_ID_BCM5481			0x0143bca0
 #define PHY_ID_BCM54810			0x03625d00
+#define PHY_ID_BCM54811			0x03625cc0
 #define PHY_ID_BCM5482			0x0143bcb0
 #define PHY_ID_BCM5411			0x00206070
 #define PHY_ID_BCM5421			0x002060e0
@@ -24,6 +25,9 @@
 #define PHY_ID_BCM54616S		0x03625d10
 #define PHY_ID_BCM57780			0x03625d90
 
+#define PHY_ID_BCM72113			0x35905310
+#define PHY_ID_BCM72116			0x35905350
+#define PHY_ID_BCM72165			0x35905340
 #define PHY_ID_BCM7250			0xae025280
 #define PHY_ID_BCM7255			0xae025120
 #define PHY_ID_BCM7260			0xae025190
@@ -64,6 +68,7 @@
 #define PHY_BRCM_EXT_IBND_TX_ENABLE	0x00002000
 #define PHY_BRCM_CLEAR_RGMII_MODE	0x00004000
 #define PHY_BRCM_DIS_TXCRXC_NOENRGY	0x00008000
+#define PHY_BRCM_IDDQ_SUSPEND		0x00010000
 
 /* Broadcom BCM7xxx specific workarounds */
 #define PHY_BRCM_7XXX_REV(x)		(((x) >> 8) & 0xff)
@@ -80,8 +85,10 @@
 
 #define MII_BCM54XX_EXP_DATA	0x15	/* Expansion register data */
 #define MII_BCM54XX_EXP_SEL	0x17	/* Expansion register select */
+#define MII_BCM54XX_EXP_SEL_TOP	0x0d00	/* TOP_MISC expansion register select */
 #define MII_BCM54XX_EXP_SEL_SSD	0x0e00	/* Secondary SerDes select */
 #define MII_BCM54XX_EXP_SEL_ER	0x0f00	/* Expansion register select */
+#define MII_BCM54XX_EXP_SEL_ETC	0x0d00	/* Expansion register spare + 2k mem */
 
 #define MII_BCM54XX_AUX_CTL	0x18	/* Auxiliary control register */
 #define MII_BCM54XX_ISR		0x1a	/* BCM54xx interrupt status register */
@@ -152,6 +159,7 @@
 #define  BCM54XX_SHD_SCR3_DEF_CLK125	0x0001
 #define  BCM54XX_SHD_SCR3_DLLAPD_DIS	0x0002
 #define  BCM54XX_SHD_SCR3_TRDDAPD	0x0004
+#define  BCM54XX_SHD_SCR3_RXCTXC_DIS	0x0100
 
 /* 01010: Auto Power-Down */
 #define BCM54XX_SHD_APD			0x0a
@@ -184,6 +192,7 @@
 #define MII_BCM54XX_EXP_EXP08			0x0F08
 #define  MII_BCM54XX_EXP_EXP08_RJCT_2MHZ	0x0001
 #define  MII_BCM54XX_EXP_EXP08_EARLY_DAC_WAKE	0x0200
+#define  MII_BCM54XX_EXP_EXP08_FORCE_DAC_WAKE	0x0100
 #define MII_BCM54XX_EXP_EXP75			0x0f75
 #define  MII_BCM54XX_EXP_EXP75_VDACCTRL		0x003c
 #define  MII_BCM54XX_EXP_EXP75_CM_OSC		0x0001
@@ -191,6 +200,12 @@
 #define  MII_BCM54XX_EXP_EXP96_MYST		0x0010
 #define MII_BCM54XX_EXP_EXP97			0x0f97
 #define  MII_BCM54XX_EXP_EXP97_MYST		0x0c0c
+
+/* Top-MISC expansion registers */
+#define BCM54XX_TOP_MISC_IDDQ_CTRL		(MII_BCM54XX_EXP_SEL_TOP + 0x06)
+#define BCM54XX_TOP_MISC_IDDQ_LP		(1 << 0)
+#define BCM54XX_TOP_MISC_IDDQ_SD		(1 << 2)
+#define BCM54XX_TOP_MISC_IDDQ_SR		(1 << 3)
 
 /*
  * BCM5482: Secondary SerDes registers
@@ -207,6 +222,9 @@
 #define BCM54810_SHD_CLK_CTL			0x3
 #define BCM54810_SHD_CLK_CTL_GTXCLK_EN		(1 << 9)
 
+/* BCM54612E Registers */
+#define BCM54612E_EXP_SPARE0		(MII_BCM54XX_EXP_SEL_ETC + 0x34)
+#define BCM54612E_LED4_CLK125OUT_EN	(1 << 1)
 
 /*****************************************************************************/
 /* Fast Ethernet Transceiver definitions. */

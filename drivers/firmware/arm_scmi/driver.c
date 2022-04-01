@@ -19,6 +19,7 @@
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
+#include <linux/hashtable.h>
 #include <linux/mailbox_client.h>
 #include <linux/module.h>
 #include <linux/of_address.h>
@@ -50,6 +51,7 @@
 	(((header) >> MSG_PROTOCOL_ID_SHIFT) & MSG_PROTOCOL_ID_MASK)
 #define MSG_XTRACT_TOKEN(header)	\
 	(((header) >> MSG_TOKEN_ID_SHIFT) & MSG_TOKEN_ID_MASK)
+#define MSG_TOKEN_MAX		(MSG_TOKEN_ID_MASK + 1)
 
 enum scmi_error_codes {
 	SCMI_SUCCESS = 0,	/* Success */
@@ -70,26 +72,34 @@ enum scmi_error_codes {
 static LIST_HEAD(scmi_list);
 /* Protection for the entire list */
 static DEFINE_MUTEX(scmi_list_mutex);
+/* Track the unique id for the transfers for debug & profiling purpose */
+static atomic_t transfer_last_id;
 
 static int max_rx_timeout_ms;
 module_param(max_rx_timeout_ms, int, 0664);
 
-static struct scmi_xfer *scmi_one_xfer_get(const struct scmi_handle *handle);
+static struct scmi_xfer *scmi_one_xfer_get(const struct scmi_handle *handle,
+					   bool set_pending);
 
 /**
  * struct scmi_xfers_info - Structure to manage transfer information
  *
- * @xfer_block: Preallocated Message array
  * @xfer_alloc_table: Bitmap table for allocated messages.
  *	Index of this bitmap table is also used for message
  *	sequence identifier.
  * @xfer_lock: Protection for message allocation
+ * @free_xfers: A free list for available to use xfers. It is initialized with
+ *		a number of xfers equal to the maximum allowed in-flight
+ *		messages.
+ * @pending_xfers: An hashtable, indexed by msg_hdr.seq, used to keep all the
+ *		   currently in-flight messages.
  */
 struct scmi_xfers_info {
-	struct scmi_xfer *xfer_block;
 	unsigned long *xfer_alloc_table;
 	/* protect transfer allocation */
 	spinlock_t xfer_lock;
+	struct hlist_head free_xfers;
+	DECLARE_HASHTABLE(pending_xfers, SCMI_PENDING_XFERS_HT_ORDER_SZ);
 };
 
 /**
@@ -217,11 +227,27 @@ static void scmi_fetch_response(struct scmi_xfer *xfer,
 	memcpy_fromio(xfer->rx.buf, mem->msg_payload + 4, xfer->rx.len);
 }
 
-static void scmi_work_func(struct work_struct *work)
+/**
+ * scmi_xfer_lookup_unlocked  -  Helper to lookup an xfer_id
+ *
+ * @minfo: Pointer to Tx/Rx Message management info based on channel type
+ * @xfer_id: Token ID to lookup in @pending_xfers
+ *
+ * Refcounting is untouched.
+ *
+ * Context: Assumes to be called with @xfer_lock already acquired.
+ *
+ * Return: A valid xfer on Success or error otherwise
+ */
+static struct scmi_xfer *
+scmi_xfer_lookup_unlocked(struct scmi_xfers_info *minfo, u16 xfer_id)
 {
-	struct scmi_xfer *xfer = container_of(work, struct scmi_xfer, work);
+	struct scmi_xfer *xfer = NULL;
 
-	(void)xfer->async_agent_callback(xfer);
+	if (test_bit(xfer_id, minfo->xfer_alloc_table))
+		xfer = XFER_FIND(minfo->pending_xfers, xfer_id);
+
+	return xfer ?: ERR_PTR(-EINVAL);
 }
 
 /**
@@ -238,6 +264,7 @@ static void scmi_work_func(struct work_struct *work)
  */
 static void scmi_a2p_rx_callback(struct mbox_client *cl, void *m)
 {
+	unsigned long flags;
 	struct scmi_xfer *xfer;
 	struct scmi_chan_info *cinfo = client_to_scmi_chan_info(cl);
 	struct device *dev = cinfo->dev;
@@ -251,15 +278,15 @@ static void scmi_a2p_rx_callback(struct mbox_client *cl, void *m)
 	xfer_id = MSG_XTRACT_TOKEN(hdr);
 	msg_type = MSG_XTRACT_TYPE(hdr);
 
-	/*
-	 * Are we even expecting this?
-	 */
-	if (!test_bit(xfer_id, minfo->xfer_alloc_table)) {
+	/* Are we even expecting this? */
+	spin_lock_irqsave(&minfo->xfer_lock, flags);
+	xfer = scmi_xfer_lookup_unlocked(minfo, xfer_id);
+	spin_unlock_irqrestore(&minfo->xfer_lock, flags);
+	if (IS_ERR(xfer)) {
 		dev_err(dev, "message for %d is not expected!\n", xfer_id);
 		return;
 	}
 
-	xfer = &minfo->xfer_block[xfer_id];
 	scmi_dump_header_dbg(dev, &xfer->hdr);
 
 	/* Is the message of valid length? */
@@ -271,22 +298,6 @@ static void scmi_a2p_rx_callback(struct mbox_client *cl, void *m)
 
 	scmi_fetch_response(xfer, mem);
 	complete(&xfer->done);
-
-	if (msg_type == MSG_TYPE_DELAYED && xfer->async_agent_callback) {
-		/*
-		 * We typically expect the platform to come back with
-		 * MSG_TYPE_DELAYED when the user specifies an async
-		 * message.  If the platform decides to do it immediately
-		 * and respond on the a2p channel we still need to invoke
-		 * the callback.
-		 */
-		if (xfer->defer_async_callback) {
-			INIT_WORK(&xfer->work, scmi_work_func);
-			schedule_work(&xfer->work);
-		} else {
-			xfer->async_agent_callback(xfer);
-		}
-	}
 }
 
 /**
@@ -352,8 +363,6 @@ static void scmi_p2a_tx_prepare(struct mbox_client *cl, void *m)
  * Processes one received message to appropriate transfer information and
  * signals completion of the transfer.
  *
- * NOTE: This function will be invoked in IRQ context unless the caller
- * has explicitly requested to defer the callback to a workqueue.
  */
 static void scmi_p2a_rx_callback(struct mbox_client *cl, void *m)
 {
@@ -361,10 +370,8 @@ static void scmi_p2a_rx_callback(struct mbox_client *cl, void *m)
 	struct scmi_chan_info *cinfo = client_to_scmi_chan_info(cl);
 	struct device *dev = cinfo->dev;
 	struct scmi_info *info = handle_to_scmi_info(cinfo->handle);
-	struct scmi_xfers_info *minfo = &info->minfo;
 	struct scmi_shared_mem __iomem *mem = cinfo->payload;
 	u32 hdr = ioread32(&mem->msg_header);
-	u16 xfer_id;
 	u8 msg_type, prot_id, msg_id;
 	scmi_cback_fn_t prot_callback;
 
@@ -373,7 +380,7 @@ static void scmi_p2a_rx_callback(struct mbox_client *cl, void *m)
 	prot_id = MSG_XTRACT_PROT_ID(hdr);
 
 	if (msg_type == MSG_TYPE_NOTIFY) {
-		xfer = scmi_one_xfer_get(cinfo->handle);
+		xfer = scmi_one_xfer_get(cinfo->handle, false);
 		if (IS_ERR(xfer)) {
 			dev_err(dev, "P2A notification xfer alloc fail! prot=%x, msg=%x\n",
 				prot_id, msg_id);
@@ -396,30 +403,9 @@ static void scmi_p2a_rx_callback(struct mbox_client *cl, void *m)
 			/* Callback is expected to call xfer put */
 			prot_callback(xfer);
 		}
-
-	} else if (msg_type == MSG_TYPE_DELAYED) {
-		/*
-		 * Are we even expecting this?
-		 */
-		xfer_id = MSG_XTRACT_TOKEN(hdr);
-		if (!test_bit(xfer_id, minfo->xfer_alloc_table)) {
-			dev_err(dev, "P2A delayed response is not expected! prot=%x, msg=%x\n",
+	} else {
+		dev_err(dev, "Unexpected P2A message, prot=%x, msg=%x.  Discarding...\n",
 				prot_id, msg_id);
-			return;
-		}
-
-		xfer = &minfo->xfer_block[xfer_id];
-		scmi_dump_header_dbg(dev, &xfer->hdr);
-		scmi_fetch_response(xfer, mem);
-
-		if (xfer->async_agent_callback) {
-			if (xfer->defer_async_callback) {
-				INIT_WORK(&xfer->work, scmi_work_func);
-				schedule_work(&xfer->work);
-			} else {
-				xfer->async_agent_callback(xfer);
-			}
-		}
 	}
 
 	/* Acknowlege the message */
@@ -427,9 +413,128 @@ static void scmi_p2a_rx_callback(struct mbox_client *cl, void *m)
 }
 
 /**
+ * scmi_xfer_token_set  - Reserve and set new token for the xfer at hand
+ *
+ * @minfo: Pointer to Tx/Rx Message management info based on channel type
+ * @xfer: The xfer to act upon
+ *
+ * Pick the next unused monotonically increasing token and set it into
+ * xfer->hdr.seq: picking a monotonically increasing value avoids immediate
+ * reuse of freshly completed or timed-out xfers, thus mitigating the risk
+ * of incorrect association of a late and expired xfer with a live in-flight
+ * transaction, both happening to re-use the same token identifier.
+ *
+ * Since platform is NOT required to answer our request in-order we should
+ * account for a few rare but possible scenarios:
+ *
+ *  - exactly 'next_token' may be NOT available so pick xfer_id >= next_token
+ *    using find_next_zero_bit() starting from candidate next_token bit
+ *
+ *  - all tokens ahead upto (MSG_TOKEN_ID_MASK - 1) are used in-flight but we
+ *    are plenty of free tokens at start, so try a second pass using
+ *    find_next_zero_bit() and starting from 0.
+ *
+ *  X = used in-flight
+ *
+ * Normal
+ * ------
+ *
+ *		|- xfer_id picked
+ *   -----------+----------------------------------------------------------
+ *   | | |X|X|X| | | | | | ... ... ... ... ... ... ... ... ... ... ...|X|X|
+ *   ----------------------------------------------------------------------
+ *		^
+ *		|- next_token
+ *
+ * Out-of-order pending at start
+ * -----------------------------
+ *
+ *	  |- xfer_id picked, last_token fixed
+ *   -----+----------------------------------------------------------------
+ *   |X|X| | | | |X|X| ... ... ... ... ... ... ... ... ... ... ... ...|X| |
+ *   ----------------------------------------------------------------------
+ *    ^
+ *    |- next_token
+ *
+ *
+ * Out-of-order pending at end
+ * ---------------------------
+ *
+ *	  |- xfer_id picked, last_token fixed
+ *   -----+----------------------------------------------------------------
+ *   |X|X| | | | |X|X| ... ... ... ... ... ... ... ... ... ... |X|X|X||X|X|
+ *   ----------------------------------------------------------------------
+ *								^
+ *								|- next_token
+ *
+ * Context: Assumes to be called with @xfer_lock already acquired.
+ *
+ * Return: 0 on Success or error
+ */
+static int scmi_xfer_token_set(struct scmi_xfers_info *minfo,
+			       struct scmi_xfer *xfer)
+{
+	unsigned long xfer_id, next_token;
+
+	/*
+	 * Pick a candidate monotonic token in range [0, MSG_TOKEN_MAX - 1]
+	 * using the pre-allocated transfer_id as a base.
+	 * Note that the global transfer_id is shared across all message types
+	 * so there could be holes in the allocated set of monotonic sequence
+	 * numbers, but that is going to limit the effectiveness of the
+	 * mitigation only in very rare limit conditions.
+	 */
+	next_token = (xfer->transfer_id & (MSG_TOKEN_MAX - 1));
+
+	/* Pick the next available xfer_id >= next_token */
+	xfer_id = find_next_zero_bit(minfo->xfer_alloc_table,
+				     MSG_TOKEN_MAX, next_token);
+	if (xfer_id == MSG_TOKEN_MAX) {
+		/*
+		 * After heavily out-of-order responses, there are no free
+		 * tokens ahead, but only at start of xfer_alloc_table so
+		 * try again from the beginning.
+		 */
+		xfer_id = find_next_zero_bit(minfo->xfer_alloc_table,
+					     MSG_TOKEN_MAX, 0);
+		/*
+		 * Something is wrong if we got here since there can be a
+		 * maximum number of (MSG_TOKEN_MAX - 1) in-flight messages
+		 * but we have not found any free token [0, MSG_TOKEN_MAX - 1].
+		 */
+		if (WARN_ON_ONCE(xfer_id == MSG_TOKEN_MAX))
+			return -ENOMEM;
+	}
+
+	/* Update +/- last_token accordingly if we skipped some hole */
+	if (xfer_id != next_token)
+		atomic_add((int)(xfer_id - next_token), &transfer_last_id);
+
+	/* Set in-flight */
+	set_bit(xfer_id, minfo->xfer_alloc_table);
+	xfer->hdr.seq = (u16)xfer_id;
+
+	return 0;
+}
+
+/**
+ * scmi_xfer_token_clear  - Release the token
+ *
+ * @minfo: Pointer to Tx/Rx Message management info based on channel type
+ * @xfer: The xfer to act upon
+ */
+static inline void scmi_xfer_token_clear(struct scmi_xfers_info *minfo,
+					 struct scmi_xfer *xfer)
+{
+	clear_bit(xfer->hdr.seq, minfo->xfer_alloc_table);
+}
+
+/**
  * scmi_one_xfer_get() - Allocate one message
  *
  * @handle: SCMI entity handle
+ * @set_pending: If true a monotonic token is picked and the xfer is added to
+ *		 the pending hash table.
  *
  * Helper function which is used by various command functions that are
  * exposed to clients of this driver for allocating a message traffic event.
@@ -440,30 +545,46 @@ static void scmi_p2a_rx_callback(struct mbox_client *cl, void *m)
  *
  * Return: 0 if all went fine, else corresponding error.
  */
-static struct scmi_xfer *scmi_one_xfer_get(const struct scmi_handle *handle)
+static struct scmi_xfer *scmi_one_xfer_get(const struct scmi_handle *handle,
+					   bool set_pending)
 {
-	u16 xfer_id;
+	int ret;
+	unsigned long flags;
 	struct scmi_xfer *xfer;
-	unsigned long flags, bit_pos;
 	struct scmi_info *info = handle_to_scmi_info(handle);
 	struct scmi_xfers_info *minfo = &info->minfo;
 
-	/* Keep the locked section as small as possible */
 	spin_lock_irqsave(&minfo->xfer_lock, flags);
-	bit_pos = find_first_zero_bit(minfo->xfer_alloc_table,
-				      info->desc->max_msg);
-	if (bit_pos == info->desc->max_msg) {
+	if (hlist_empty(&minfo->free_xfers)) {
 		spin_unlock_irqrestore(&minfo->xfer_lock, flags);
 		return ERR_PTR(-ENOMEM);
 	}
-	set_bit(bit_pos, minfo->xfer_alloc_table);
+
+	/* grab an xfer from the free_list */
+	xfer = hlist_entry(minfo->free_xfers.first, struct scmi_xfer, node);
+	hlist_del_init(&xfer->node);
+
+	/*
+	 * Allocate transfer_id early so that can be used also as base for
+	 * monotonic sequence number generation if needed.
+	 */
+	xfer->transfer_id = atomic_inc_return(&transfer_last_id);
+
+	if (set_pending) {
+		/* Pick and set monotonic token */
+		ret = scmi_xfer_token_set(minfo, xfer);
+		if (!ret) {
+			hash_add(minfo->pending_xfers, &xfer->node,
+				 xfer->hdr.seq);
+			xfer->pending = true;
+		} else {
+			dev_err(handle->dev,
+				"Failed to get monotonic token %d\n", ret);
+			hlist_add_head(&xfer->node, &minfo->free_xfers);
+			xfer = ERR_PTR(ret);
+		}
+	}
 	spin_unlock_irqrestore(&minfo->xfer_lock, flags);
-
-	xfer_id = bit_pos;
-
-	xfer = &minfo->xfer_block[xfer_id];
-	xfer->hdr.seq = xfer_id;
-	reinit_completion(&xfer->done);
 
 	return xfer;
 }
@@ -482,17 +603,14 @@ void scmi_one_xfer_put(const struct scmi_handle *handle, struct scmi_xfer *xfer)
 	struct scmi_info *info = handle_to_scmi_info(handle);
 	struct scmi_xfers_info *minfo = &info->minfo;
 
-	/*
-	 * Keep the locked section as small as possible
-	 * NOTE: we might escape with smp_mb and no lock here..
-	 * but just be conservative and symmetric.
-	 */
 	spin_lock_irqsave(&minfo->xfer_lock, flags);
-	clear_bit(xfer->hdr.seq, minfo->xfer_alloc_table);
+	if (xfer->pending) {
+		scmi_xfer_token_clear(minfo, xfer);
+		hash_del(&xfer->node);
+		xfer->pending = false;
+	}
+	hlist_add_head(&xfer->node, &minfo->free_xfers);
 	spin_unlock_irqrestore(&minfo->xfer_lock, flags);
-	/* Reset vars that help do an async callback */
-	xfer->async_agent_callback = NULL;
-	xfer->defer_async_callback = false;
 }
 
 static bool
@@ -537,6 +655,7 @@ int scmi_do_xfer(const struct scmi_handle *handle, struct scmi_xfer *xfer)
 	struct device *dev = info->dev;
 	struct scmi_chan_info *cinfo;
 
+	reinit_completion(&xfer->done);
 	cinfo = idr_find(&info->tx_idr, xfer->hdr.protocol_id);
 	if (unlikely(!cinfo))
 		return -EINVAL;
@@ -613,7 +732,7 @@ int scmi_one_xfer_init(const struct scmi_handle *handle, u8 msg_id, u8 prot_id,
 	    tx_size > info->desc->max_msg_size)
 		return -ERANGE;
 
-	xfer = scmi_one_xfer_get(handle);
+	xfer = scmi_one_xfer_get(handle, true);
 	if (IS_ERR(xfer)) {
 		ret = PTR_ERR(xfer);
 		dev_err(dev, "failed to get free message slot(%d)\n", ret);
@@ -772,20 +891,27 @@ static int scmi_xfer_info_init(struct scmi_info *sinfo)
 		return -EINVAL;
 	}
 
-	info->xfer_block = devm_kcalloc(dev, desc->max_msg,
-					sizeof(*info->xfer_block), GFP_KERNEL);
-	if (!info->xfer_block)
-		return -ENOMEM;
+	hash_init(info->pending_xfers);
 
-	info->xfer_alloc_table = devm_kcalloc(dev, BITS_TO_LONGS(desc->max_msg),
+	/* Allocate a bitmask sized to hold MSG_TOKEN_MAX tokens */
+	info->xfer_alloc_table = devm_kcalloc(dev, BITS_TO_LONGS(MSG_TOKEN_MAX),
 					      sizeof(long), GFP_KERNEL);
 	if (!info->xfer_alloc_table)
 		return -ENOMEM;
 
-	bitmap_zero(info->xfer_alloc_table, desc->max_msg);
+	bitmap_zero(info->xfer_alloc_table, MSG_TOKEN_MAX);
 
-	/* Pre-initialize the buffer pointer to pre-allocated buffers */
-	for (i = 0, xfer = info->xfer_block; i < desc->max_msg; i++, xfer++) {
+	/*
+	 * Preallocate a number of xfers equal to max inflight messages,
+	 * pre-initialize the buffer pointer to pre-allocated buffers and
+	 * attach all of them to the free list
+	 */
+	INIT_HLIST_HEAD(&info->free_xfers);
+	for (i = 0; i < desc->max_msg; i++) {
+		xfer = devm_kzalloc(dev, sizeof(*xfer), GFP_KERNEL);
+		if (!xfer)
+			return -ENOMEM;
+
 		xfer->rx.buf = devm_kcalloc(dev, sizeof(u8), desc->max_msg_size,
 					    GFP_KERNEL);
 		if (!xfer->rx.buf)
@@ -793,6 +919,9 @@ static int scmi_xfer_info_init(struct scmi_info *sinfo)
 
 		xfer->tx.buf = xfer->rx.buf;
 		init_completion(&xfer->done);
+
+		/* Add initialized xfer to the free list */
+		hlist_add_head(&xfer->node, &info->free_xfers);
 	}
 
 	spin_lock_init(&info->xfer_lock);

@@ -1147,6 +1147,17 @@ static int bcm2835_pinctrl_probe(struct platform_device *pdev)
 	if (IS_ERR(pc->base))
 		return PTR_ERR(pc->base);
 
+	pc->pctl_dev = devm_pinctrl_register(dev, &bcm2835_pinctrl_desc, pc);
+	if (IS_ERR(pc->pctl_dev)) {
+		gpiochip_remove(&pc->gpio_chip);
+		return PTR_ERR(pc->pctl_dev);
+	}
+
+	pc->gpio_range = bcm2835_pinctrl_gpio_range;
+	pc->gpio_range.base = pc->gpio_chip.base;
+	pc->gpio_range.gc = &pc->gpio_chip;
+	pinctrl_add_gpio_range(pc->pctl_dev, &pc->gpio_range);
+
 	pc->gpio_chip = bcm2835_gpio_chip;
 	pc->gpio_chip.parent = dev;
 	pc->gpio_chip.of_node = np;
@@ -1155,7 +1166,8 @@ static int bcm2835_pinctrl_probe(struct platform_device *pdev)
 			&irq_domain_simple_ops, NULL);
 	if (!pc->irq_domain) {
 		dev_err(dev, "could not create IRQ domain\n");
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto out_remove;
 	}
 
 	for (i = 0; i < BCM2835_NUM_GPIOS; i++) {
@@ -1196,8 +1208,10 @@ static int bcm2835_pinctrl_probe(struct platform_device *pdev)
 
 		len = strlen(dev_name(pc->dev)) + 16;
 		name = devm_kzalloc(pc->dev, len, GFP_KERNEL);
-		if (!name)
-			return -ENOMEM;
+		if (!name) {
+			err = -ENOMEM;
+			goto out_remove;
+		}
 		snprintf(name, len, "%s:bank%d", dev_name(pc->dev), i);
 
 		err = devm_request_irq(dev, pc->irq[i],
@@ -1205,7 +1219,7 @@ static int bcm2835_pinctrl_probe(struct platform_device *pdev)
 			name, &pc->irq_data[i]);
 		if (err) {
 			dev_err(dev, "unable to request IRQ %d\n", pc->irq[i]);
-			return err;
+			goto out_remove;
 		}
 
 		/* These are optional interrupts */
@@ -1220,21 +1234,14 @@ static int bcm2835_pinctrl_probe(struct platform_device *pdev)
 	err = gpiochip_add_data(&pc->gpio_chip, pc);
 	if (err) {
 		dev_err(dev, "could not add GPIO chip\n");
-		return err;
+		goto out_remove;
 	}
-
-	pc->pctl_dev = devm_pinctrl_register(dev, &bcm2835_pinctrl_desc, pc);
-	if (IS_ERR(pc->pctl_dev)) {
-		gpiochip_remove(&pc->gpio_chip);
-		return PTR_ERR(pc->pctl_dev);
-	}
-
-	pc->gpio_range = bcm2835_pinctrl_gpio_range;
-	pc->gpio_range.base = pc->gpio_chip.base;
-	pc->gpio_range.gc = &pc->gpio_chip;
-	pinctrl_add_gpio_range(pc->pctl_dev, &pc->gpio_range);
 
 	return 0;
+
+out_remove:
+	pinctrl_remove_gpio_range(pc->pctl_dev, &pc->gpio_range);
+	return err;
 }
 
 static int bcm2835_pinctrl_remove(struct platform_device *pdev)

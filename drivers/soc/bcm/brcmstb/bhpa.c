@@ -43,10 +43,10 @@
 
 #define MAX_BHPA_REGIONS	8
 
-#define B_LOG_WRN(args...) pr_warn(args)
-#define B_LOG_MSG(args...) pr_info(args)
-#define B_LOG_DBG(args...) pr_debug(args)
-#define B_LOG_TRACE(args...) do { if (0) pr_debug(args); } while (0)
+#define B_LOG_WRN(fmt, args...) pr_warn(fmt "\n", ## args)
+#define B_LOG_MSG(fmt, args...) pr_info(fmt "\n", ## args)
+#define B_LOG_DBG(fmt, args...) pr_debug(fmt "\n", ## args)
+#define B_LOG_TRACE(fmt, args...) do { if (0) pr_debug(fmt "\n", ## args); } while (0)
 
 struct bhpa_region {
 	phys_addr_t		addr;
@@ -97,6 +97,7 @@ struct bhpa_allocator {
 
 static struct bhpa_region bhpa_regions[MAX_BHPA_REGIONS];
 static unsigned int n_bhpa_regions;
+static bool bhpa_disabled;
 static DEFINE_MUTEX(bhpa_lock);
 struct bhpa_allocator bhpa_allocator;
 
@@ -139,7 +140,7 @@ static int __init __bhpa_setup(phys_addr_t addr, phys_addr_t size)
  */
 static int __init bhpa_setup(char *str)
 {
-	phys_addr_t addr = 0, end = 0, size;
+	phys_addr_t addr, end = 0, size;
 	char *orig_str = str;
 	int ret;
 
@@ -155,6 +156,18 @@ static int __init bhpa_setup(char *str)
 	addr = ALIGN(addr, BHPA_ALIGN);
 	end = ALIGN_DOWN(end, BHPA_ALIGN);
 	size = end - addr;
+
+	if (size == 0) {
+		pr_info("disabling reserved memory\n");
+		bhpa_disabled = true;
+		return 0;
+	}
+
+	if (addr < memblock_start_of_DRAM()) {
+		pr_warn("ignoring invalid range '%s' below addressable DRAM\n",
+			orig_str);
+		return 0;
+	}
 
 	if (addr > end || size < pageblock_nr_pages << PAGE_SHIFT) {
 		pr_warn("ignoring invalid range '%s' (too small)\n",
@@ -184,14 +197,14 @@ static __init void split_bhpa_region(phys_addr_t addr, struct bhpa_region *p)
 			(++tmp)->addr = addr;
 			tmp->size -= addr - p->addr;
 			end = addr + tmp->size;
-			B_LOG_DBG("region split: 0x%pa-0x%pa", &addr, &end);
+			B_LOG_DBG("region split: %pa-%pa", &addr, &end);
 		} else {
 			B_LOG_WRN("bhpa region truncated (MAX_BHPA_REGIONS)");
 		}
 	}
 	p->size = addr - p->addr;
 	end = p->addr + p->size;
-	B_LOG_DBG("region added: 0x%pa-0x%pa", &p->addr, &end);
+	B_LOG_DBG("region added: %pa-%pa", &p->addr, &end);
 }
 
 static __init void intersect_bhpa_ranges(phys_addr_t start, phys_addr_t size,
@@ -200,12 +213,12 @@ static __init void intersect_bhpa_ranges(phys_addr_t start, phys_addr_t size,
 	struct bhpa_region *tmp, *p = *ptr;
 	phys_addr_t end = start + size;
 
-	B_LOG_DBG("range: 0x%pa-0x%pa", &start, &end);
+	B_LOG_DBG("range: %pa-%pa", &start, &end);
 	while (p < &bhpa_regions[n_bhpa_regions] &&
 	       p->addr + p->size <= start) {
 		tmp = p;
 		end = p->addr + p->size;
-		B_LOG_WRN("unmapped bhpa region 0x%pa-0x%pa",
+		B_LOG_WRN("unmapped bhpa region %pa-%pa",
 			   &p->addr, &end);
 
 		n_bhpa_regions--;
@@ -229,7 +242,7 @@ static __init void intersect_bhpa_ranges(phys_addr_t start, phys_addr_t size,
 			return;
 		}
 
-		B_LOG_DBG("intersection: 0x%pa-0x%pa", &start, &last);
+		B_LOG_DBG("intersection: %pa-%pa", &start, &last);
 		p->size -= start - p->addr;
 		p->addr = start;
 
@@ -280,7 +293,7 @@ static void __init bhpa_alloc_ranges(void)
 		 * the search for efficiency.
 		 */
 		if (!memblock_reserve(p->addr, p->size)) {
-			B_LOG_MSG("Alloc: MEMC%d: 0x%pa-0x%pa", p->memc,
+			B_LOG_MSG("Alloc: MEMC%d: %pa-%pa", p->memc,
 				&p->addr, &end);
 			/*
 			 * The min_count is set to 0 so that memblock
@@ -289,7 +302,7 @@ static void __init bhpa_alloc_ranges(void)
 			kmemleak_alloc_phys(p->addr, p->size, 0, 0);
 			p++;
 		} else {
-			B_LOG_WRN("bhpa reservation 0x%pa-0x%pa failed!",
+			B_LOG_WRN("bhpa reservation %pa-%pa failed!",
 				&p->addr, &end);
 			while (++p < &bhpa_regions[n_bhpa_regions])
 				*(p - 1) = *p;
@@ -304,6 +317,17 @@ void __init brcmstb_bhpa_reserve(void)
 	struct bhpa_region *p, *tmp;
 	u64 loop;
 	int i;
+
+	if (bhpa_disabled) {
+		n_bhpa_regions = 0;
+		return;
+	}
+
+	if (brcmstb_default_reserve == BRCMSTB_RESERVE_BHPA &&
+			!n_bhpa_regions &&
+			!brcmstb_memory_override_defaults &&
+			!movable_start)
+		brcmstb_memory_default_reserve(__bhpa_setup);
 
 	if (!movable_start)
 		return;
@@ -336,7 +360,7 @@ void __init brcmstb_bhpa_reserve(void)
 	for (i = 0; i < n_bhpa_regions; i++) {
 		p = &bhpa_regions[i];
 		end = p->addr + p->size;
-		B_LOG_DBG("region: 0x%pa-0x%pa", &p->addr, &end);
+		B_LOG_DBG("region: %pa-%pa", &p->addr, &end);
 	}
 
 	p = bhpa_regions;
@@ -344,7 +368,7 @@ void __init brcmstb_bhpa_reserve(void)
 	while (p < &bhpa_regions[n_bhpa_regions]) {
 		tmp = &bhpa_regions[--n_bhpa_regions];
 		end = tmp->addr + tmp->size;
-		B_LOG_WRN("Drop region: 0x%pa-0x%pa", &tmp->addr, &end);
+		B_LOG_WRN("Drop region: %pa-%pa", &tmp->addr, &end);
 	}
 
 	if (!n_bhpa_regions)
@@ -361,7 +385,7 @@ void __init brcmstb_bhpa_reserve(void)
 	while (p < &bhpa_regions[n_bhpa_regions]) {
 		tmp = &bhpa_regions[--n_bhpa_regions];
 		end = tmp->addr + tmp->size;
-		B_LOG_WRN("Drop region: 0x%pa-%pa", &tmp->addr, &end);
+		B_LOG_WRN("Drop region: %pa-%pa", &tmp->addr, &end);
 	}
 
 	bhpa_alloc_ranges();
@@ -415,18 +439,19 @@ static struct page *bhpa_get_free_range_in_zone(struct zone *zone,
 						unsigned int order)
 {
 	struct page *free_page = NULL;
+	unsigned long flags;
 
 	if (!populated_zone(zone))
 		return NULL;
 	B_LOG_TRACE("free_range: zone:%p %s at %lx",
 		    (void *)zone, zone->name, zone->zone_start_pfn);
-	spin_lock(&zone->lock);
 	for (; order < MAX_ORDER; order++) {
 		struct free_area *area = &(zone->free_area[order]);
 		struct page *page;
 
 		B_LOG_TRACE("free_range: zone:%p area:%p order:%u migratetype:%u",
 			    (void *)zone, (void *)area, order, migratetype);
+		spin_lock_irqsave(&zone->lock, flags);
 		list_for_each_entry(page, &area->free_list[migratetype], lru) {
 			unsigned long pfn;
 
@@ -441,10 +466,10 @@ static struct page *bhpa_get_free_range_in_zone(struct zone *zone,
 				break;
 			}
 		}
+		spin_unlock_irqrestore(&zone->lock, flags);
 		if (free_page)
 			break;
 	}
-	spin_unlock(&zone->lock);
 	return free_page;
 }
 
@@ -704,21 +729,20 @@ static int bhpa_block_alloc_fast(struct bhpa_block *block,
 		B_LOG_DBG("block_alloc_fast:%p:%u allocated: %u:(%lu) %#llx (%lx..%lx)",
 			  block, order, count, free_bit,
 			  (unsigned long long)free_start, pfn_start, pfn_end);
-		if (!test_and_set_bit(free_bit, block->busy) &&
-		    !WARN_ON(!block->free)) {
-			unsigned int fast_page_size;
-
-			block->free--;
-			block->stats.allocated++;
-			block->stats.high_allocated =
-				max(block->stats.high_allocated,
-				    block->stats.allocated);
-			fast_page_size = get_order(BHPA_SIZE) - order;
-			WARN_ON(fast_page_size >=
-				sizeof(block->stats.allocations.fast) /
-				sizeof(block->stats.allocations.fast[0]));
-			block->stats.allocations.fast[fast_page_size]++;
+		if (test_and_set_bit(free_bit, block->busy)) {
+			block->stats.busy--;
+			block->free++;
 		}
+
+		if (!WARN_ON(!block->free))
+			block->free--;
+
+		block->stats.allocated++;
+		block->stats.high_allocated = max(block->stats.high_allocated,
+						  block->stats.allocated);
+		WARN_ON((BHPA_ORDER - order) >=
+			ARRAY_SIZE(block->stats.allocations.fast));
+		block->stats.allocations.fast[BHPA_ORDER - order]++;
 		set_bit(free_bit, block->allocated);
 		pages[*allocated] = free_start;
 		(*allocated)++;
@@ -945,7 +969,7 @@ static void bhpa_memc_print(struct seq_file *seq, const struct bhpa_memc *a,
 
 static int bhpa_memc_alloc(struct bhpa_memc *a, unsigned memcIndex, uint64_t *pages,
 			   unsigned int count, unsigned int *allocated,
-			   const struct brcmstb_range *range)
+			   const struct brcmstb_range *range, gfp_t flags)
 {
 	struct bhpa_block *block;
 	int rc = 0;
@@ -1007,7 +1031,8 @@ static int bhpa_memc_alloc(struct bhpa_memc *a, unsigned memcIndex, uint64_t *pa
 	}
 done:
 	if (rc == 0) {
-		if (count != 0 && range == NULL && !list_empty(&a->blocks)) {
+		if (count != 0 && range == NULL && !list_empty(&a->blocks) &&
+		    !(flags & __GFP_NOWARN)) {
 			pr_err("BHPA MEMC%u Out of memory\n", memcIndex);
 			bhpa_memc_print(NULL, a, memcIndex);
 			dump_stack();
@@ -1170,7 +1195,7 @@ core_initcall(bhpa_init);
  */
 int brcmstb_hpa_alloc(unsigned int memcIndex, uint64_t *pages,
 		      unsigned int count, unsigned int *alloced,
-		      const struct brcmstb_range *range)
+		      const struct brcmstb_range *range, gfp_t flags)
 {
 	int rc;
 
@@ -1184,7 +1209,7 @@ int brcmstb_hpa_alloc(unsigned int memcIndex, uint64_t *pages,
 		return rc;
 
 	rc = bhpa_memc_alloc(&bhpa_allocator.memc[memcIndex], memcIndex, pages, count,
-			     alloced, range);
+			     alloced, range, flags);
 
 	mutex_unlock(&bhpa_lock);
 	return rc;

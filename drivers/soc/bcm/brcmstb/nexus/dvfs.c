@@ -42,16 +42,20 @@ do {						\
 
 enum brcm_protocol_cmd {
 	BRCM_SEND_AVS_CMD = 0x3,
-	BRCM_CLK_SHOW_CMD = 0x4,
+	BRCM_CLK_SHOW_CMD = 0x4, /* obsoleted */
 	BRCM_PMAP_SHOW_CMD = 0x5,
 	BRCM_CLK_SHOW_NEW_CMD = 0x6,
 	BRCM_RESET_ENABLE_CMD = 0x7,
 	BRCM_RESET_DISABLE_CMD = 0x8,
 	BRCM_OVERTEMP_RESET_CMD = 0x9,
+	BRCM_SCMI_STATS_SHOW_CMD = 0xa,
+	BRCM_SCMI_STATS_RESET_CMD = 0xb,
+	BRCM_TRACE_LOG_ON_CMD = 0xc,
+	BRCM_GET_CLK_VER_STR = 0xd,
 };
 
-static const char *pmap_cores[BCLK_SW_NUM_CORES - BCLK_SW_OFFSET] = {
-	[BCLK_SW_CPU_CORE - BCLK_SW_OFFSET] = "cpu",
+static const char __maybe_unused *pmap_cores[BCLK_SW_NUM_CORES] = {
+	[BCLK_SW_CPU0 - BCLK_SW_OFFSET] = "cpu0",
 	[BCLK_SW_V3D - BCLK_SW_OFFSET] = "v3d0",
 	[BCLK_SW_SYSIF - BCLK_SW_OFFSET] = "sysif0",
 	[BCLK_SW_SCB - BCLK_SW_OFFSET] = "scb0",
@@ -71,6 +75,12 @@ static const char *pmap_cores[BCLK_SW_NUM_CORES - BCLK_SW_OFFSET] = {
 	[BCLK_SW_VPU0 - BCLK_SW_OFFSET] = "vpu0",
 	[BCLK_SW_BNE0 - BCLK_SW_OFFSET] = "bne0",
 	[BCLK_SW_ASP0 - BCLK_SW_OFFSET] = "asp0",
+	[BCLK_SW_HVD_CABAC0 - BCLK_SW_OFFSET] = "hvd_cabac0",
+	[BCLK_SW_AXI0 - BCLK_SW_OFFSET] = "axi0",
+	[BCLK_SW_BSTM0 - BCLK_SW_OFFSET] = "bstm0",
+	[BCLK_SW_CPU1 - BCLK_SW_OFFSET] = "cpu1",
+	[BCLK_SW_CPU2 - BCLK_SW_OFFSET] = "cpu2",
+	[BCLK_SW_CPU3 - BCLK_SW_OFFSET] = "cpu3",
 };
 
 static const struct scmi_handle *handle;
@@ -87,6 +97,7 @@ static void clk_api_unlock(void)
 	mutex_unlock(&clk_api_mutex);
 }
 
+#if IS_ENABLED(CONFIG_ARM_SCMI_PROTOCOL)
 static int avs_ret_to_linux_ret(int avs_ret)
 {
 	int ret;
@@ -172,6 +183,35 @@ static int brcm_send_cmd_via_scmi(const struct scmi_handle *handle,
 	return ret;
 }
 
+static int scmi_brcm_protocol_init(struct scmi_handle *handle)
+{
+	u32 version;
+
+	scmi_version_get(handle, SCMI_PROTOCOL_BRCM, &version);
+
+	dev_dbg(handle->dev, "Brcm SCMI Version %d.%d\n",
+		PROTOCOL_REV_MAJOR(version), PROTOCOL_REV_MINOR(version));
+
+	return 0;
+}
+
+static int __init scmi_brcm_init(void)
+{
+	return scmi_protocol_register(SCMI_PROTOCOL_BRCM,
+				      &scmi_brcm_protocol_init, NULL);
+}
+subsys_initcall(scmi_brcm_init);
+#else
+static inline int brcm_send_cmd_via_scmi(const struct scmi_handle *handle,
+					 unsigned int cmd, unsigned int sub_cmd,
+					 unsigned int protocol,
+					 unsigned int num_in, unsigned int num_out,
+					 u32 *params)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_ARM_SCMI_PROTOCOL */
+
 static int brcm_send_avs_cmd_via_scmi(const struct scmi_handle *handle,
 				      unsigned int sub_cmd, unsigned int num_in,
 				      unsigned int num_out, u32 *params)
@@ -191,47 +231,56 @@ static int brcm_send_show_cmd_via_scmi(struct seq_file *s,
 				       const struct scmi_handle *handle,
 				       unsigned int cmd)
 {
+#define MAX_SHOW_CHARS			256
+
+	char buf[MAX_SHOW_CHARS];
+	char *pbuf = buf;
 	int state = 0;
 	u32 params[SCMI_MAX_STRINGLEN/4 + 1]; /* state + string len */
-	char *str = (char *) &params[0]; /* out */;
+	char * const str = (char *) &params[0]; /* out */
+	ssize_t n_avail, len;
 
+	buf[0] = 0;
 	do {
+		bool continuation = false;
+
 		params[0] = state; /* in */
 		state = brcm_send_cmd_via_scmi(handle, cmd, 0,
 					     SCMI_PROTOCOL_BRCM,
 					     1, ARRAY_SIZE(params),
 					     params);
-		if (state <= 0)
+		if (state < 0)
 			break;
 
-		SEQ_PRINTF(s, "%s\n", str);
-	} while (state);
+		n_avail = MAX_SHOW_CHARS - (pbuf - &buf[0]) - 1;
+		len = strnlen(str, MAX_SHOW_CHARS - 1);
+		if (n_avail <= 0 || len > MAX_SHOW_CHARS - 1)
+			return -EIO;
 
-	if (state == 0)
-		/* last line if there is no scmi error */
-		SEQ_PRINTF(s, "%s\n", str);
+		/* If line ends in '\', drop the '\' character */
+		if (len > 0 && str[len - 1] == '\\') {
+			continuation = true;
+			str[len - 1] = 0;
+			len--;
+		}
+
+		strncat(pbuf, str, n_avail);
+		pbuf += (len < n_avail) ? len : n_avail;
+		n_avail = MAX_SHOW_CHARS - (pbuf - &buf[0]) - 1;
+
+		/* If line ends in '\', hold off on printing it */
+		if (continuation && n_avail > 1)
+			continue;
+
+		/* Print a line */
+		pbuf[0] = 0;
+		SEQ_PRINTF(s, "%s\n", buf);
+		pbuf = &buf[0];
+		buf[0] = 0;
+	} while (state > 0);
 
 	return state ? state : 0;
 }
-
-static int scmi_brcm_protocol_init(struct scmi_handle *handle)
-{
-	u32 version;
-
-	scmi_version_get(handle, SCMI_PROTOCOL_BRCM, &version);
-
-	dev_dbg(handle->dev, "Brcm SCMI Version %d.%d\n",
-		PROTOCOL_REV_MAJOR(version), PROTOCOL_REV_MINOR(version));
-
-	return 0;
-}
-
-static int __init scmi_brcm_init(void)
-{
-	return scmi_protocol_register(SCMI_PROTOCOL_BRCM,
-				      &scmi_brcm_protocol_init, NULL);
-}
-subsys_initcall(scmi_brcm_init);
 
 static int brcmstb_send_avs_cmd(unsigned int cmd, unsigned int in,
 			    unsigned int out, u32 args[AVS_MAX_PARAMS])
@@ -268,43 +317,118 @@ int brcm_pmap_num_pstates(unsigned int core_id, unsigned int *num_pstates)
 	if (!handle)
 		return -EINVAL;
 	perf_ops = handle->perf_ops;
-	if (core_id <= BCLK_SW_OFFSET || core_id >= BCLK_SW_NUM_CORES)
+	if (domain >= BCLK_SW_NUM_CORES)
 		return -EINVAL;
 
 	clk_api_lock();
 	ret = perf_ops->get_num_domain_opps(handle, domain, num_pstates);
 	clk_api_unlock();
 
-	return (ret == 0 && *num_pstates == 0) ? -EINVAL : ret;
+	if (!ret && (*num_pstates == 0 || *num_pstates > MAX_PSTATES))
+		ret = -EIO;
+
+	return ret;
 }
 EXPORT_SYMBOL(brcm_pmap_num_pstates);
 
-int brcm_pmap_get_pstate(unsigned int core_id, unsigned int *pstate)
+static int get_all_pmap_freq_info(int core_id, unsigned int *num_pstates,
+				  unsigned int *cur_pstate, unsigned int *freqs)
 {
-	struct scmi_perf_ops *perf_ops = handle->perf_ops;
+	struct scmi_perf_ops *perf_ops;
 	unsigned int domain = core_id - BCLK_SW_OFFSET;
-	int ret;
+	int ret, i;
 
-	if (core_id <= BCLK_SW_OFFSET || core_id >= BCLK_SW_NUM_CORES)
+	if (!handle)
 		return -EINVAL;
 
-	clk_api_lock();
-	ret = perf_ops->level_get(handle, domain, pstate, false);
-	clk_api_unlock();
+	perf_ops = handle->perf_ops;
 
-	return ret;
+	if (domain >= BCLK_SW_NUM_CORES)
+		return -EINVAL;
+
+	memset(freqs, 0, sizeof(*freqs) * MAX_PSTATES);
+
+	ret = brcm_pmap_num_pstates(core_id, num_pstates);
+	if (ret < 0)
+		return ret;
+
+	clk_api_lock();
+	ret = perf_ops->level_get(handle, domain, cur_pstate, false);
+	clk_api_unlock();
+	if (ret < 0)
+		return ret;
+
+	ret = brcm_pmap_get_pstate_freqs(core_id, freqs);
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * For the CPU domain only the ->level_get() call returns
+	 * the frequency and this has to be converted into
+	 * our idea of a pstate number.
+	 */
+	if (domain == 0) {
+		const unsigned int freq = *cur_pstate;
+
+		*cur_pstate = MAX_PSTATES + 1;
+		for (i = 0; i < *num_pstates; i++) {
+			if (freq == freqs[i]) {
+				*cur_pstate = i;
+				break;
+			}
+		}
+	}
+	if (*cur_pstate >= *num_pstates)
+		return -EIO;
+
+	return 0;
+}
+
+int brcm_pmap_get_pstate(unsigned int core_id, unsigned int *pstate)
+{
+	unsigned int num_pstates, freqs[MAX_PSTATES];
+
+	return get_all_pmap_freq_info(core_id, &num_pstates, pstate, freqs);
 }
 EXPORT_SYMBOL(brcm_pmap_get_pstate);
 
 int brcm_pmap_set_pstate(unsigned int core_id, unsigned int pstate)
 {
 
-	struct scmi_perf_ops *perf_ops = handle->perf_ops;
-	unsigned int domain = core_id - BCLK_SW_OFFSET;
+	struct scmi_perf_ops *perf_ops;
+	unsigned int num_pstates, domain = core_id - BCLK_SW_OFFSET;
 	int ret;
 
-	if (core_id <= BCLK_SW_OFFSET || core_id >= BCLK_SW_NUM_CORES)
+	if (!handle)
 		return -EINVAL;
+
+	perf_ops = handle->perf_ops;
+
+	if (domain >= BCLK_SW_NUM_CORES)
+		return -EINVAL;
+
+	if (pstate >= MAX_PSTATES)
+		return -EINVAL;
+
+	ret = brcm_pmap_num_pstates(core_id, &num_pstates);
+	if (ret)
+		return ret;
+	if (pstate >= num_pstates)
+		return -EINVAL;
+
+	/*
+	 * For the CPU domain only the ->level_set() call expects
+	 * the frequency as its argument whereas other cores
+	 * expect our idea of a pstate number.
+	 */
+	if (domain == 0) {
+		unsigned int freqs[MAX_PSTATES];
+
+		ret = brcm_pmap_get_pstate_freqs(core_id, freqs);
+		if (ret)
+			return ret;
+		pstate = freqs[pstate];
+	}
 
 	clk_api_lock();
 	ret = perf_ops->level_set(handle, domain, pstate, false);
@@ -318,10 +442,15 @@ int brcm_pmap_get_pstate_freqs(unsigned int core_id, u32 *freqs)
 {
 	int ret;
 	u32 freq_cnt, i;
-	struct scmi_perf_ops *perf_ops = handle->perf_ops;
+	struct scmi_perf_ops *perf_ops;
 	unsigned int domain = core_id - BCLK_SW_OFFSET;
 
-	if (core_id <= BCLK_SW_OFFSET || core_id >= BCLK_SW_NUM_CORES)
+	if (!handle)
+		return -EINVAL;
+
+	perf_ops = handle->perf_ops;
+
+	if (domain >= BCLK_SW_NUM_CORES)
 		return -EINVAL;
 
 	ret = brcm_pmap_num_pstates(core_id, &freq_cnt);
@@ -331,8 +460,9 @@ int brcm_pmap_get_pstate_freqs(unsigned int core_id, u32 *freqs)
 	clk_api_lock();
 	ret = perf_ops->domain_freqs_get(handle, domain, freqs);
 	/* sort frequencies in descending order */
-	for (i = 0; i < freq_cnt/2; i++)
-		swap(freqs[i], freqs[freq_cnt - i - 1]);
+	if (ret == 0)
+		for (i = 0; i < freq_cnt/2; i++)
+			swap(freqs[i], freqs[freq_cnt - i - 1]);
 
 	clk_api_unlock();
 
@@ -345,7 +475,7 @@ int brcm_reset_assert(unsigned int reset_id)
 	int ret;
 	u32 params = reset_id - BRST_SW_OFFSET;
 
-	if (reset_id <= BRST_SW_OFFSET || reset_id >= BRST_SW_NUM_CORES)
+	if (params >= BRST_SW_NUM_CORES)
 		return -EINVAL;
 
 	clk_api_lock();
@@ -364,7 +494,7 @@ int brcm_reset_deassert(unsigned int reset_id)
 	int ret;
 	u32 params = reset_id - BRST_SW_OFFSET;
 
-	if (reset_id <= BRST_SW_OFFSET || reset_id >= BRST_SW_NUM_CORES)
+	if (params >= BRST_SW_NUM_CORES)
 		return -EINVAL;
 
 	clk_api_lock();
@@ -397,7 +527,64 @@ EXPORT_SYMBOL(brcm_overtemp_reset);
 #ifdef CONFIG_DEBUG_FS
 #include <linux/debugfs.h>
 
+struct trace_log_dfs_info {
+	struct dentry *d_tlroot;
+	uint32_t active;
+	uint32_t flag;
+	uint64_t logbuf_paddr;
+	uint32_t logbuf_size;
+};
+
 static struct dentry *rootdir;
+static struct trace_log_dfs_info tldfs;
+
+
+static int brcm_scmi_get_clk_ver_str(char *str, unsigned int buf_len)
+{
+#define MAX_CLK_VER_CHARS 64
+	u32 params[(MAX_CLK_VER_CHARS + 3) / 4];
+	const int nparams = ARRAY_SIZE(params);
+	const size_t max_len = buf_len < sizeof(params) ? buf_len : sizeof(params);
+	int ret;
+
+	if (!str)
+		return -EINVAL;
+	*str = 0;
+
+	clk_api_lock();
+	ret = brcm_send_cmd_via_scmi(handle, BRCM_GET_CLK_VER_STR, 0,
+				     SCMI_PROTOCOL_BRCM, 0, nparams, params);
+	clk_api_unlock();
+
+	if (ret == 0)
+		strncpy(str, (const char *)params, max_len - 1);
+	str[max_len - 1] = 0;
+
+	return ret;
+}
+
+static int brcm_scmi_stats_show(struct seq_file *s, void *data)
+{
+	int ret;
+
+	clk_api_lock();
+	ret = brcm_send_show_cmd_via_scmi(s, handle, BRCM_SCMI_STATS_SHOW_CMD);
+	clk_api_unlock();
+
+	return ret;
+}
+
+static int brcm_scmi_stats_reset(void)
+{
+	int ret;
+	u32 param;
+
+	ret = brcm_send_cmd_via_scmi(handle, BRCM_SCMI_STATS_RESET_CMD,
+				     0, SCMI_PROTOCOL_BRCM, 0, 0, &param);
+	clk_api_unlock();
+
+	return ret;
+}
 
 static int brcm_scmi_clk_summary_show(struct seq_file *s, void *data)
 {
@@ -429,7 +616,8 @@ static int filp_to_core_id(struct file *filp)
 	return BCLK_SW_OFFSET + (p - &pmap_cores[0]);
 }
 
-static int uint_from_buf(const char *ubuf, size_t len, unsigned int *result)
+static int uint_from_buf(const char __user *ubuf, size_t len,
+			 unsigned int *result)
 {
 	char buf[32];
 
@@ -441,22 +629,19 @@ static int uint_from_buf(const char *ubuf, size_t len, unsigned int *result)
 	return kstrtouint(buf, 10, result);
 }
 
-static int get_all_pmap_freq_info(int core_id, unsigned int *num_pstates,
-				  unsigned int *cur_pstate, unsigned int *freqs)
+static int brcm_scmi_stats_summary_open(struct inode *inode, struct file *file)
 {
-	int ret;
-
-	ret = brcm_pmap_num_pstates(core_id, num_pstates);
-	if (ret < 0)
-		return ret;
-	if (*num_pstates > MAX_PSTATES)
-		return -EINVAL;
-	ret = brcm_pmap_get_pstate(core_id, cur_pstate);
-	if (ret < 0)
-		return ret;
-	return brcm_pmap_get_pstate_freqs(core_id, freqs);
+	return single_open(file, brcm_scmi_stats_show, inode->i_private);
 }
 
+static ssize_t brcm_scmi_stats_reset_write(struct file *filp,
+					   const char __user *ubuf,
+					   size_t len, loff_t *offp)
+{
+	int ret = brcm_scmi_stats_reset();
+
+	return ret ? ret : len;
+}
 
 static int brcm_scmi_clk_summary_open(struct inode *inode, struct file *file)
 {
@@ -532,10 +717,14 @@ static ssize_t brcm_scmi_pmap_all_freqs(struct file *filp, char __user *ubuf,
 {
 	int ret, i;
 	char buf[16 * MAX_PSTATES];
-	unsigned int freqs[MAX_PSTATES], size, num_pstates, cur_pstate;
+	unsigned int freqs[MAX_PSTATES], size, num_pstates;
 	const int core_id = filp_to_core_id(filp);
 
-	ret = get_all_pmap_freq_info(core_id, &num_pstates, &cur_pstate, freqs);
+	ret = brcm_pmap_get_pstate_freqs(core_id, freqs);
+	if (ret)
+		return ret;
+
+	ret = brcm_pmap_num_pstates(core_id, &num_pstates);
 	if (ret < 0)
 		return ret;
 
@@ -597,7 +786,83 @@ static ssize_t brcm_scmi_pmap_num_pstates(struct file *filp, char __user *ubuf,
 	return simple_read_from_buffer(ubuf, count, offp, buf, size);
 }
 
+static int brcm_send_trace_log_cmd_via_scmi(const struct scmi_handle *handle,
+					    unsigned int cmd)
+{
+	int ret;
+	u32 params[5];
+	int i = 0;
 
+	params[i++] = tldfs.active;
+	params[i++] = tldfs.flag;
+	params[i++] = lower_32_bits(tldfs.logbuf_paddr);
+	params[i++] = upper_32_bits(tldfs.logbuf_paddr);
+	params[i++] = tldfs.logbuf_size;
+
+	ret = brcm_send_cmd_via_scmi(handle, cmd, 0,
+				     SCMI_PROTOCOL_BRCM,
+				     ARRAY_SIZE(params),
+				     0,
+				     params);
+	return ret;
+}
+
+static ssize_t brcm_trace_log_on_rd(struct file *filp,
+				    char __user *ubuf,
+				    size_t count, loff_t *offp)
+{
+	char buf[4];
+	unsigned int size;
+	int ret;
+
+	size = snprintf(buf, sizeof(buf), "%u\n", tldfs.active);
+	ret = simple_read_from_buffer(ubuf, count, offp, buf, size);
+
+	return ret;
+}
+
+static ssize_t brcm_trace_log_on_wt(struct file *filp,
+				    const char __user *ubuf,
+				    size_t len, loff_t *offp)
+{
+	int sts = len, ret;
+	unsigned int on;
+
+	clk_api_lock();
+	ret = uint_from_buf(ubuf, len, &on);
+	if (ret < 0) {
+		sts = ret;
+		goto trace_out;
+	}
+
+	if (tldfs.active == on)
+		goto trace_out;
+
+	tldfs.active = on;
+	ret = simple_write_to_buffer(&on, 4, offp, ubuf, len);
+	if (ret < 0) {
+		sts = ret;
+		goto trace_out;
+	}
+
+	ret = brcm_send_trace_log_cmd_via_scmi(handle, BRCM_TRACE_LOG_ON_CMD);
+	if (ret < 0)
+		sts = ret;
+trace_out:
+	clk_api_unlock();
+	return sts;
+}
+
+static const struct file_operations brcm_scmi_stats_reset_fops = {
+	.write		= brcm_scmi_stats_reset_write,
+};
+
+static const struct file_operations brcm_scmi_stats_summary_fops = {
+	.open		= brcm_scmi_stats_summary_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
 
 static const struct file_operations brcm_scmi_clk_summary_fops = {
 	.open		= brcm_scmi_clk_summary_open,
@@ -631,9 +896,60 @@ static const struct file_operations brcm_scmi_pmap_cur_pstate_fops = {
 	.write		= brcm_scmi_pmap_cur_pstate_wt,
 };
 
+static const struct file_operations brcm_trace_log_on_fops = {
+	.read		= brcm_trace_log_on_rd,
+	.write		= brcm_trace_log_on_wt,
+};
+
 static const struct file_operations brcm_scmi_pmap_num_pstates_fops = {
 	.read		= brcm_scmi_pmap_num_pstates,
 };
+
+/**
+ * brcm_trace_log_debug_init - lazily populate the debugfs brcm_trace_log
+ * directory
+ *
+ * This function populates the debugfs brcm_trace directory once at boot-time
+ * when we know that debugfs is setup. It should only be called once at
+ * boot-time.
+ */
+static int brcm_trace_log_debug_init(void)
+{
+	struct dentry *d;
+
+	memset(&tldfs, 0, sizeof(struct trace_log_dfs_info));
+
+	tldfs.d_tlroot = debugfs_create_dir("brcm-trace", NULL);
+
+	if (!tldfs.d_tlroot)
+		return -ENOMEM;
+
+	d = debugfs_create_file("tracing_on", 0644, tldfs.d_tlroot,
+				&tldfs.active, &brcm_trace_log_on_fops);
+
+	if (!d)
+		return -ENOMEM;
+
+	d = debugfs_create_x32("flag", 0644, tldfs.d_tlroot, &tldfs.flag);
+
+	if (!d)
+		return -ENOMEM;
+
+	d = debugfs_create_x64("phys_addr64", 0644, tldfs.d_tlroot,
+			       &tldfs.logbuf_paddr);
+
+	if (!d)
+		return -ENOMEM;
+
+	d = debugfs_create_u32("buf_size", 0644, tldfs.d_tlroot,
+			       &tldfs.logbuf_size);
+
+	if (!d)
+		return -ENOMEM;
+
+
+	return 0;
+}
 
 /**
  * brcm_scmi_debug_init - lazily populate the debugfs brcm_scmi directory
@@ -665,11 +981,23 @@ static int brcm_scmi_debug_init(void)
 	if (!d)
 		return -ENOMEM;
 
+	d = debugfs_create_file("stats_summary", 0644, rootdir, NULL,
+				&brcm_scmi_stats_summary_fops);
+
+	if (!d)
+		return -ENOMEM;
+
+	d = debugfs_create_file("stats_reset", 0644, rootdir, NULL,
+				&brcm_scmi_stats_reset_fops);
+
+	if (!d)
+		return -ENOMEM;
+
 	d_cores = debugfs_create_dir("pmap_cores", rootdir);
 	if (!d_cores)
 		return -ENOMEM;
 
-	for (i = 0; i < BCLK_SW_NUM_CORES - BCLK_SW_OFFSET; i++) {
+	for (i = 0; i < BCLK_SW_NUM_CORES; i++) {
 		struct dentry *d_core;
 
 		if (brcm_pmap_num_pstates(i + BCLK_SW_OFFSET, &n))
@@ -714,6 +1042,7 @@ static int brcm_scmi_debug_init(void)
 
 	return 0;
 }
+
 #endif
 
 /**
@@ -1027,6 +1356,31 @@ int brcmstb_avs_get_pmic_reg_status(u8 regulator, u16 *voltage,
 }
 EXPORT_SYMBOL(brcmstb_avs_get_pmic_reg_status);
 
+static void clk_blob_ver_check(struct scmi_device *sdev)
+{
+	struct device_node *dn = sdev->dev.of_node;
+	char ams_clk_ver_str[64];
+	const char *bolt_clk_ver_str = NULL;
+
+	ams_clk_ver_str[0] = 0;
+
+	if (dn
+	    && of_property_read_string(dn, "brcm,clk-ver", &bolt_clk_ver_str) == 0
+	    && brcm_scmi_get_clk_ver_str(ams_clk_ver_str, sizeof(ams_clk_ver_str)) == 0
+	    && ams_clk_ver_str[0]) {
+		if (strcmp(bolt_clk_ver_str, ams_clk_ver_str)) {
+			dev_err(&sdev->dev, "ClkVerTest: FAIL: Clock version string mismatch:\n");
+			dev_err(&sdev->dev, "                : BOLT %s\n", bolt_clk_ver_str);
+			dev_err(&sdev->dev, "                :  AMS %s\n", ams_clk_ver_str);
+		} else {
+			dev_dbg(&sdev->dev, "ClkVerTest: PASS: %s\n", ams_clk_ver_str);
+		}
+	} else {
+		dev_dbg(&sdev->dev, "ClkVerTest: PASS: by default; cannot test\n");
+	}
+}
+
+
 static int brcm_scmi_dvfs_probe(struct scmi_device *sdev)
 {
 	int value = 0;
@@ -1038,7 +1392,9 @@ static int brcm_scmi_dvfs_probe(struct scmi_device *sdev)
 
 #ifdef CONFIG_DEBUG_FS
 	brcm_scmi_debug_init();
+	brcm_trace_log_debug_init();
 #endif
+	clk_blob_ver_check(sdev);
 
 	/* This tells AVS we are using the new API */
 	(void)brcmstb_stb_avs_read_debug(0, &value);

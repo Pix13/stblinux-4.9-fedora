@@ -186,6 +186,10 @@ static int part_panic_write(struct mtd_info *mtd, loff_t to, size_t len,
 		size_t *retlen, const u_char *buf)
 {
 	struct mtd_part *part = mtd_to_part(mtd);
+
+	if (mtd->oops_panic_write)
+		part->master->oops_panic_write = true;
+
 	return part->master->_panic_write(part->master, to + part->offset, len,
 					  retlen, buf);
 }
@@ -249,8 +253,6 @@ void mtd_erase_callback(struct erase_info *instr)
 			instr->fail_addr -= part->offset;
 		instr->addr -= part->offset;
 	}
-	if (instr->callback)
-		instr->callback(instr);
 }
 EXPORT_SYMBOL_GPL(mtd_erase_callback);
 

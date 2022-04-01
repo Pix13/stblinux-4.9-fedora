@@ -168,7 +168,6 @@ static void sdhci_iproc_writeb(struct sdhci_host *host, u8 val, int reg)
 	sdhci_iproc_writel(host, newval, reg & ~3);
 }
 
-#ifdef CONFIG_PM_SLEEP
 static int sdhci_iproc_suspend(struct device *dev)
 {
 	struct sdhci_host *host = dev_get_drvdata(dev);
@@ -182,6 +181,7 @@ static int sdhci_iproc_suspend(struct device *dev)
 	return res;
 }
 
+#ifdef CONFIG_PM_SLEEP
 static int sdhci_iproc_resume(struct device *dev)
 {
 	struct sdhci_host *host = dev_get_drvdata(dev);
@@ -349,9 +349,10 @@ err:
 static void sdhci_iproc_shutdown(struct platform_device *pdev)
 {
 	struct sdhci_host *host = platform_get_drvdata(pdev);
-	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
 
-	clk_disable_unprepare(pltfm_host->clk);
+	/* Cancel possible rescan worker thread */
+	cancel_delayed_work_sync(&host->mmc->detect);
+	sdhci_iproc_suspend(&pdev->dev);
 }
 
 static struct platform_driver sdhci_iproc_driver = {

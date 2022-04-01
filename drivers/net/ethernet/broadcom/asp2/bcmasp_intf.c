@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt)			"bcmasp_intf: " fmt
+
+#include <asm/byteorder.h>
+#include <linux/brcmphy.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
@@ -6,13 +11,13 @@
 #include <linux/of_mdio.h>
 #include <linux/phy.h>
 #include <linux/phy_fixed.h>
+#include <linux/ptp_classify.h>
 #include <linux/platform_device.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
 
 #include "bcmasp.h"
 #include "bcmasp_intf_defs.h"
-
 
 static inline int incr_ring(int index, int ring_count)
 {
@@ -25,7 +30,7 @@ static inline int incr_ring(int index, int ring_count)
 
 /* Points to last byte of descriptor */
 static inline dma_addr_t incr_last_byte(dma_addr_t addr, dma_addr_t beg,
-				 int ring_count)
+					int ring_count)
 {
 	dma_addr_t end = beg + (ring_count * DESC_SIZE);
 
@@ -38,7 +43,7 @@ static inline dma_addr_t incr_last_byte(dma_addr_t addr, dma_addr_t beg,
 
 /* Points to first byte of descriptor */
 static inline dma_addr_t incr_first_byte(dma_addr_t addr, dma_addr_t beg,
-				  int ring_count)
+					 int ring_count)
 {
 	dma_addr_t end = beg + (ring_count * DESC_SIZE);
 
@@ -61,13 +66,13 @@ static inline void bcmasp_enable_tx(struct bcmasp_intf *intf, int en)
 		tx_spb_ctrl_wl(intf, 0x0, TX_SPB_CTRL_ENABLE);
 		tx_epkt_core_wl(intf, 0x0, TX_EPKT_C_CFG_MISC);
 	}
-
 }
 
 static inline void bcmasp_enable_rx(struct bcmasp_intf *intf, int en)
 {
 	if (en)
-		rx_edpkt_cfg_wl(intf, RX_EDPKT_CFG_ENABLE_EN, RX_EDPKT_CFG_ENABLE);
+		rx_edpkt_cfg_wl(intf, RX_EDPKT_CFG_ENABLE_EN,
+				RX_EDPKT_CFG_ENABLE);
 	else
 		rx_edpkt_cfg_wl(intf, 0x0, RX_EDPKT_CFG_ENABLE);
 }
@@ -127,74 +132,220 @@ set_promisc:
 	spin_unlock_bh(&intf->parent->mda_lock);
 }
 
-static int tx_spb_ring_full(struct bcmasp_intf *intf)
+static void bcmasp_clean_txcb(struct bcmasp_intf *intf, int index)
 {
-	int next_index;
+	struct bcmasp_tx_cb *txcb = &intf->tx_cbs[index];
 
-	/* Grab next index, if it is the clean index, ring is full */
-	next_index = incr_ring(intf->tx_spb_index, DESC_RING_COUNT);
-	if (next_index == intf->tx_spb_clean_index)
-		return 1;
+	txcb->skb = NULL;
+	dma_unmap_addr_set(txcb, dma_addr, 0);
+	dma_unmap_len_set(txcb, dma_len, 0);
+	txcb->last = false;
+}
+
+static int tx_spb_ring_full(struct bcmasp_intf *intf, int cnt)
+{
+	int next_index, i;
+
+	/* Check if we have enough room for cnt descriptors */
+	for (i = 0; i < cnt; i++) {
+		next_index = incr_ring(intf->tx_spb_index, DESC_RING_COUNT);
+		if (next_index == intf->tx_spb_clean_index)
+			return 1;
+	}
 
 	return 0;
 }
 
-static netdev_tx_t bcmasp_xmit(struct sk_buff *skb,
-			struct net_device *dev)
+static struct sk_buff *bcmasp_csum_offload(struct net_device *dev,
+					   struct sk_buff *skb,
+					   bool *csum_hw)
+{
+	struct bcmasp_intf *intf = netdev_priv(dev);
+	u32 header = 0, header2 = 0, epkt = 0;
+	struct bcmasp_pkt_offload *offload;
+	struct sk_buff *new_skb;
+	unsigned int header_cnt = 0;
+	u16 ip_ver;
+	u8 ip_proto;
+
+	if (skb->ip_summed != CHECKSUM_PARTIAL)
+		return skb;
+
+	if (unlikely(skb_headroom(skb) < sizeof(*offload))) {
+		new_skb = skb_realloc_headroom(skb, sizeof(*offload));
+		if (!new_skb) {
+			intf->mib.tx_realloc_offload_failed++;
+			goto help;
+		}
+
+		dev_consume_skb_any(skb);
+		skb = new_skb;
+		intf->mib.tx_realloc_offload++;
+	}
+
+	ip_ver = htons(skb->protocol);
+	switch (ip_ver) {
+	case ETH_P_IP:
+		header |= PKT_OFFLOAD_HDR_SIZE_2((ip_hdrlen(skb) >> 8) & 0xf);
+		header2 |= PKT_OFFLOAD_HDR2_SIZE_2(ip_hdrlen(skb) & 0xff);
+		epkt |= PKT_OFFLOAD_EPKT_IP(0) | PKT_OFFLOAD_EPKT_CSUM_L2;
+		ip_proto = ip_hdr(skb)->protocol;
+		header_cnt += 2;
+		break;
+	case ETH_P_IPV6:
+		header |= PKT_OFFLOAD_HDR_SIZE_2((IP6_HLEN >> 8) & 0xf);
+		header2 |= PKT_OFFLOAD_HDR2_SIZE_2(IP6_HLEN & 0xff);
+		epkt |= PKT_OFFLOAD_EPKT_IP(1) | PKT_OFFLOAD_EPKT_CSUM_L2;
+		ip_proto = ipv6_hdr(skb)->nexthdr;
+		header_cnt += 2;
+		break;
+	default:
+		goto help;
+	}
+
+	switch (ip_proto) {
+	case IPPROTO_TCP:
+		header2 |= PKT_OFFLOAD_HDR2_SIZE_3(tcp_hdrlen(skb));
+		epkt |= PKT_OFFLOAD_EPKT_TP(0) | PKT_OFFLOAD_EPKT_CSUM_L3;
+		header_cnt++;
+		break;
+	case IPPROTO_UDP:
+		header2 |= PKT_OFFLOAD_HDR2_SIZE_3(UDP_HLEN);
+		epkt |= PKT_OFFLOAD_EPKT_TP(1) | PKT_OFFLOAD_EPKT_CSUM_L3;
+		header_cnt++;
+		break;
+	default:
+		goto help;
+	}
+
+	offload = (struct bcmasp_pkt_offload *)skb_push(skb, sizeof(*offload));
+
+	header |= PKT_OFFLOAD_HDR_OP | PKT_OFFLOAD_HDR_COUNT(header_cnt) |
+			  PKT_OFFLOAD_HDR_SIZE_1(ETH_HLEN);
+	epkt |= PKT_OFFLOAD_EPKT_OP;
+
+	offload->nop = htonl(PKT_OFFLOAD_NOP);
+	offload->header = htonl(header);
+	offload->header2 = htonl(header2);
+	offload->epkt = htonl(epkt);
+	offload->end = htonl(PKT_OFFLOAD_END_OP);
+	*csum_hw = true;
+
+	return skb;
+
+help:
+	skb_checksum_help(skb);
+
+	return skb;
+}
+
+static netdev_tx_t bcmasp_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct bcmasp_intf *intf = netdev_priv(dev);
 	struct device *kdev = &intf->parent->pdev->dev;
 	struct bcmasp_desc *desc;
 	struct bcmasp_tx_cb *txcb;
-	dma_addr_t mapping;
-	int ret;
+	dma_addr_t mapping, valid;
+	bool csum_hw = false;
+	unsigned int total_bytes, size;
+	int spb_index, nr_frags, ret, i, j;
+	skb_frag_t *frag;
 
 	spin_lock(&intf->tx_lock);
 
-	if (tx_spb_ring_full(intf)) {
+	nr_frags = skb_shinfo(skb)->nr_frags;
+
+	if (tx_spb_ring_full(intf, nr_frags + 1)) {
 		netif_stop_queue(dev);
 		netdev_err(dev, "Tx Ring Full!\n");
 		ret = NETDEV_TX_BUSY;
 		goto out;
 	}
 
-	mapping = dma_map_single(kdev, skb->data, skb->len, DMA_TO_DEVICE);
-	if (dma_mapping_error(kdev, mapping)) {
-		netif_err(intf, tx_err, dev,"DMA map failed at %p (len=%d\n",
-			skb->data, skb->len);
+	/* Save skb len before adding csum offload header */
+	total_bytes = skb->len;
+	skb = bcmasp_csum_offload(dev, skb, &csum_hw);
+	if (!skb) {
 		ret = NETDEV_TX_OK;
-		intf->mib.tx_dma_failed++;
 		goto out;
 	}
 
-	txcb = &intf->tx_cbs[intf->tx_spb_index];
-	txcb->skb = skb;
-	dma_unmap_addr_set(txcb, dma_addr, mapping);
-	dma_unmap_len_set(txcb, dma_len, skb->len);
+	spb_index = intf->tx_spb_index;
+	valid = intf->tx_spb_dma_valid;
+	for (i = 0; i <= nr_frags; i++) {
+		if (!i) {
+			size = skb_headlen(skb);
+			mapping = dma_map_single(kdev, skb->data, size,
+						 DMA_TO_DEVICE);
+		} else {
+			frag = &skb_shinfo(skb)->frags[i - 1];
+			size = skb_frag_size(frag);
+			mapping = skb_frag_dma_map(kdev, frag, 0, size,
+						   DMA_TO_DEVICE);
+		}
 
-	desc = &intf->tx_spb_cpu[intf->tx_spb_index];
-	desc->buf = mapping;
-	desc->size = skb->len;
-	desc->flags = DESC_INT_EN | DESC_SOF | DESC_EOF;
+		if (dma_mapping_error(kdev, mapping)) {
+			netif_err(intf, tx_err, dev,
+				  "DMA map failed at %p (len=%d\n",
+				  skb->data, skb->len);
+			ret = NETDEV_TX_OK;
+			intf->mib.tx_dma_failed++;
+			goto out_unmap_frags;
+		}
 
+		txcb = &intf->tx_cbs[spb_index];
+		desc = &intf->tx_spb_cpu[spb_index];
+		memset(desc, 0, sizeof(*desc));
+		txcb->skb = skb;
+		txcb->bytes_sent = total_bytes;
+		dma_unmap_addr_set(txcb, dma_addr, mapping);
+		dma_unmap_len_set(txcb, dma_len, size);
+		if (!i) {
+			desc->flags |= DESC_SOF;
+			if (csum_hw)
+				desc->flags |= DESC_EPKT_CMD;
+		}
+
+		if (i == nr_frags) {
+			desc->flags |= DESC_EOF;
+			txcb->last = true;
+		}
+
+		desc->buf = mapping;
+		desc->size = size;
+		desc->flags |= DESC_INT_EN;
+
+		netif_dbg(intf, tx_queued, dev,
+			  "%s dma_buf=%pad dma_len=0x%x flags=0x%x index=0x%x\n",
+			  __func__, &mapping, desc->size, desc->flags,
+			  spb_index);
+
+		spb_index = incr_ring(spb_index, DESC_RING_COUNT);
+		valid = incr_last_byte(valid, intf->tx_spb_dma_addr,
+				       DESC_RING_COUNT);
+	}
+
+	/* Ensure all descriptors have been written to DRAM for the
+	 * hardware to see up-to-date contents.
+	 */
 	wmb();
 
-	netif_dbg(intf, tx_queued, dev,
-		  "%s dma_buf=%pad dma_len=0x%x flags=0x%x index=0x%x\n",
-		  __func__, &mapping, desc->size, desc->flags,
-		  intf->tx_spb_index);
-
-	intf->tx_spb_index = incr_ring(intf->tx_spb_index, DESC_RING_COUNT);
-	intf->tx_spb_dma_valid = incr_last_byte(intf->tx_spb_dma_valid,
-						intf->tx_spb_dma,
-						DESC_RING_COUNT);
-
+	intf->tx_spb_index = spb_index;
+	intf->tx_spb_dma_valid = valid;
 	tx_spb_dma_wq(intf, intf->tx_spb_dma_valid, TX_SPB_DMA_VALID);
 
-	if (tx_spb_ring_full(intf))
+	if (tx_spb_ring_full(intf, MAX_SKB_FRAGS + 1))
 		netif_stop_queue(dev);
 
-	ret = NETDEV_TX_OK;
+	spin_unlock(&intf->tx_lock);
+	return NETDEV_TX_OK;
+
+out_unmap_frags:
+	spb_index = intf->tx_spb_index;
+	for (j = 0; j < i; j++) {
+		bcmasp_clean_txcb(intf, spb_index);
+		spb_index = incr_ring(spb_index, DESC_RING_COUNT);
+	}
 out:
 	spin_unlock(&intf->tx_lock);
 	return ret;
@@ -204,16 +355,12 @@ static void bcmasp_netif_start(struct net_device *dev)
 {
 	struct bcmasp_intf *intf = netdev_priv(dev);
 
-	intf->crc_fwd = !!(umac_rl(intf, UMC_CMD) & UMC_CMD_CRC_FWD);
-
 	bcmasp_set_rx_mode(dev);
 	napi_enable(&intf->tx_napi);
 	napi_enable(&intf->rx_napi);
 
 	bcmasp_enable_rx_irq(intf, 1);
 	bcmasp_enable_tx_irq(intf, 1);
-
-	phy_start(dev->phydev);
 }
 
 static inline void umac_reset(struct bcmasp_intf *intf)
@@ -247,8 +394,7 @@ static inline void umac_enable_set(struct bcmasp_intf *intf,
 		reg &= ~mask;
 	umac_wl(intf, reg, UMC_CMD);
 
-	/*
-	 * UniMAC stops on a packet boundary, wait for a full-sized packet
+	/* UniMAC stops on a packet boundary, wait for a full-sized packet
 	 * to be processed (1 msec).
 	 */
 	if (enable == 0)
@@ -275,37 +421,38 @@ static int bcmasp_tx_poll(struct napi_struct *napi, int budget)
 	read = tx_spb_dma_rq(intf, TX_SPB_DMA_READ);
 	while (intf->tx_spb_dma_read != read) {
 		txcb = &intf->tx_cbs[intf->tx_spb_clean_index];
-		desc = &intf->tx_spb_cpu[intf->tx_spb_clean_index];
 		mapping = dma_unmap_addr(txcb, dma_addr);
 
 		dma_unmap_single(kdev, mapping,
 				 dma_unmap_len(txcb, dma_len),
 				 DMA_TO_DEVICE);
 
-		intf->ndev->stats.tx_packets++;
-		intf->ndev->stats.tx_bytes += txcb->skb->len;
+		if (txcb->last) {
+			dev_consume_skb_any(txcb->skb);
+			intf->ndev->stats.tx_packets++;
+			intf->ndev->stats.tx_bytes += txcb->bytes_sent;
+		}
 
-		dev_consume_skb_any(txcb->skb);
-		txcb->skb = NULL;
-		dma_unmap_addr_set(txcb, dma_addr, 0);
-		released++;
+		desc = &intf->tx_spb_cpu[intf->tx_spb_clean_index];
 
 		netif_dbg(intf, tx_done, intf->ndev,
 			  "%s dma_buf=%pad dma_len=0x%x flags=0x%x c_index=0x%x\n",
 			  __func__, &mapping, desc->size, desc->flags,
 			  intf->tx_spb_clean_index);
 
-		desc->buf = 0x0;
-		desc->size = 0x0;
-		desc->flags = 0x0;
+		bcmasp_clean_txcb(intf, intf->tx_spb_clean_index);
+		released++;
 
 		intf->tx_spb_clean_index = incr_ring(intf->tx_spb_clean_index,
 						     DESC_RING_COUNT);
 		intf->tx_spb_dma_read = incr_first_byte(intf->tx_spb_dma_read,
-							intf->tx_spb_dma,
+							intf->tx_spb_dma_addr,
 							DESC_RING_COUNT);
 	}
 
+	/* Ensure all descriptors have been written to DRAM for the hardware
+	 * to see updated contents.
+	 */
 	wmb();
 
 	napi_complete(&intf->tx_napi);
@@ -332,19 +479,20 @@ static int bcmasp_rx_poll(struct napi_struct *napi, int budget)
 	u32 len;
 
 	valid = rx_edpkt_dma_rq(intf, RX_EDPKT_DMA_VALID) + 1;
-	if (valid == intf->rx_edpkt_dma + DESC_RING_SIZE) {
-		valid = intf->rx_edpkt_dma;
-	}
+	if (valid == intf->rx_edpkt_dma_addr + DESC_RING_SIZE)
+		valid = intf->rx_edpkt_dma_addr;
 
-	while ((processed < budget) && (valid != intf->rx_edpkt_dma_read))
-	{
-
+	while ((processed < budget) && (valid != intf->rx_edpkt_dma_read)) {
 		desc = &intf->rx_edpkt_cpu[intf->rx_edpkt_index];
 
+		/* Ensure that descriptor has been fully written to DRAM by
+		 * hardware before reading by the CPU
+		 */
 		rmb();
 
 		/* Calculate virt addr by offsetting from physical addr */
-		data = intf->rx_ring_cpu + (DESC_ADDR(desc->buf) - intf->rx_ring_dma);
+		data = intf->rx_ring_cpu +
+			(DESC_ADDR(desc->buf) - intf->rx_ring_dma);
 
 		flags = DESC_FLAGS(desc->buf);
 		if (unlikely(flags & (DESC_CRC_ERR | DESC_RX_SYM_ERR))) {
@@ -361,7 +509,8 @@ static int bcmasp_rx_poll(struct napi_struct *napi, int budget)
 
 		len = desc->size;
 
-		skb = __netdev_alloc_skb(intf->ndev, len, GFP_ATOMIC | __GFP_NOWARN);
+		skb = __netdev_alloc_skb(intf->ndev, len,
+					 GFP_ATOMIC | __GFP_NOWARN);
 		if (!skb) {
 			intf->ndev->stats.rx_errors++;
 			intf->mib.alloc_rx_skb_failed++;
@@ -380,6 +529,10 @@ static int bcmasp_rx_poll(struct napi_struct *napi, int budget)
 			len -= ETH_FCS_LEN;
 		}
 
+		if ((intf->ndev->features & NETIF_F_RXCSUM) &&
+		    (desc->buf & DESC_CHKSUM))
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+
 		skb->protocol = eth_type_trans(skb, intf->ndev);
 
 		napi_gro_receive(napi, skb);
@@ -387,12 +540,14 @@ static int bcmasp_rx_poll(struct napi_struct *napi, int budget)
 		intf->ndev->stats.rx_packets++;
 		intf->ndev->stats.rx_bytes += len;
 
-		rx_edpkt_cfg_wq(intf, (DESC_ADDR(desc->buf) + desc->size), RX_EDPKT_RING_BUFFER_READ);
 next:
+		rx_edpkt_cfg_wq(intf, (DESC_ADDR(desc->buf) + desc->size),
+				RX_EDPKT_RING_BUFFER_READ);
 		processed++;
 		intf->rx_edpkt_dma_read =
 			incr_first_byte(intf->rx_edpkt_dma_read,
-				       intf->rx_edpkt_dma, DESC_RING_COUNT);
+					intf->rx_edpkt_dma_addr,
+					DESC_RING_COUNT);
 		intf->rx_edpkt_index = incr_ring(intf->rx_edpkt_index,
 						 DESC_RING_COUNT);
 	}
@@ -468,6 +623,9 @@ static void bcmasp_adj_link(struct net_device *dev)
 		reg = rgmii_rl(intf, RGMII_OOB_CNTRL);
 		reg |= RGMII_MODE_EN;
 		rgmii_wl(intf, reg, RGMII_OOB_CNTRL);
+
+		intf->eee.eee_active = phy_init_eee(phydev, 0) >= 0;
+		bcmasp_eee_enable_set(intf, intf->eee.eee_active);
 	} else {
 		/* Disable RGMII pad */
 		reg = rgmii_rl(intf, RGMII_OOB_CNTRL);
@@ -477,7 +635,45 @@ static void bcmasp_adj_link(struct net_device *dev)
 
 	if (changed)
 		phy_print_status(phydev);
+}
 
+/* Restart and set the RX ring */
+static void bcmasp_rx_reset_ring(struct bcmasp_intf *intf)
+{
+	intf->rx_edpkt_dma_read = intf->rx_edpkt_dma_addr;
+	intf->rx_edpkt_index = 0;
+
+	/* Make sure channels are disabled */
+	rx_edpkt_cfg_wl(intf, 0x0, RX_EDPKT_CFG_ENABLE);
+
+	/* Rx SPB */
+	rx_edpkt_cfg_wq(intf, intf->rx_ring_dma, RX_EDPKT_RING_BUFFER_READ);
+	rx_edpkt_cfg_wq(intf, intf->rx_ring_dma, RX_EDPKT_RING_BUFFER_WRITE);
+	rx_edpkt_cfg_wq(intf, intf->rx_ring_dma, RX_EDPKT_RING_BUFFER_BASE);
+	rx_edpkt_cfg_wq(intf, intf->rx_ring_dma_valid,
+			RX_EDPKT_RING_BUFFER_END);
+	rx_edpkt_cfg_wq(intf, intf->rx_ring_dma_valid,
+			RX_EDPKT_RING_BUFFER_VALID);
+
+	/* EDPKT */
+	rx_edpkt_cfg_wl(intf, (RX_EDPKT_CFG_CFG0_RBUF_4K <<
+			RX_EDPKT_CFG_CFG0_DBUF_SHIFT) |
+		       (RX_EDPKT_CFG_CFG0_64_ALN <<
+			RX_EDPKT_CFG_CFG0_BALN_SHIFT) |
+		       (RX_EDPKT_CFG_CFG0_EFRM_STUF),
+			RX_EDPKT_CFG_CFG0);
+	rx_edpkt_dma_wq(intf, intf->rx_edpkt_dma_addr, RX_EDPKT_DMA_WRITE);
+	rx_edpkt_dma_wq(intf, intf->rx_edpkt_dma_addr, RX_EDPKT_DMA_READ);
+	rx_edpkt_dma_wq(intf, intf->rx_edpkt_dma_addr, RX_EDPKT_DMA_BASE);
+	rx_edpkt_dma_wq(intf, intf->rx_edpkt_dma_addr + (DESC_RING_SIZE - 1),
+			RX_EDPKT_DMA_END);
+	rx_edpkt_dma_wq(intf, intf->rx_edpkt_dma_addr + (DESC_RING_SIZE - 1),
+			RX_EDPKT_DMA_VALID);
+
+	/* RX Unimac Init */
+	umac2fb_wl(intf, UMAC2FB_CFG_DEFAULT_EN |
+		  ((intf->channel + 13) << UMAC2FB_CFG_CHID_SHIFT) |
+		  (0xc << UMAC2FB_CFG_OK_SEND_SHIFT), UMAC2FB_CFG);
 }
 
 static int bcmasp_init_rx(struct bcmasp_intf *intf)
@@ -492,17 +688,18 @@ static int bcmasp_init_rx(struct bcmasp_intf *intf)
 	intf->rx_buf_order = get_order(RING_BUFFER_SIZE);
 	buffer_pg = alloc_pages(GFP_KERNEL, intf->rx_buf_order);
 
-	dma = dma_map_page(kdev, buffer_pg, 0, RING_BUFFER_SIZE, DMA_FROM_DEVICE);
+	dma = dma_map_page(kdev, buffer_pg, 0, RING_BUFFER_SIZE,
+			   DMA_FROM_DEVICE);
 	if (dma_mapping_error(kdev, dma)) {
 		netdev_err(ndev, "Cannot allocate RX buffer\n");
-		__free_pages(virt_to_page(intf->rx_ring_cpu), intf->rx_buf_order);
+		__free_pages(buffer_pg, intf->rx_buf_order);
 		return -ENOMEM;
 	}
 	intf->rx_ring_cpu = page_to_virt(buffer_pg);
 	intf->rx_ring_dma = dma;
 	intf->rx_ring_dma_valid = intf->rx_ring_dma + RING_BUFFER_SIZE - 1;
 
-	p = dma_zalloc_coherent(kdev, DESC_RING_SIZE, &intf->rx_edpkt_dma,
+	p = dma_zalloc_coherent(kdev, DESC_RING_SIZE, &intf->rx_edpkt_dma_addr,
 				GFP_KERNEL);
 	if (!p) {
 		netdev_err(ndev, "Cannot allocate edpkt desc ring\n");
@@ -510,47 +707,17 @@ static int bcmasp_init_rx(struct bcmasp_intf *intf)
 		goto free_rx_ring;
 	}
 	intf->rx_edpkt_cpu = p;
-	intf->rx_edpkt_dma_read = intf->rx_edpkt_dma;
-
-	intf->rx_edpkt_index = 0;
 
 	netif_napi_add(intf->ndev, &intf->rx_napi, bcmasp_rx_poll,
 		       NAPI_POLL_WEIGHT);
 
-	/* Make sure channels are disabled */
-	rx_edpkt_cfg_wl(intf, 0x0, RX_EDPKT_CFG_ENABLE);
-
-	/* Rx SPB */
-	rx_edpkt_cfg_wq(intf, intf->rx_ring_dma, RX_EDPKT_RING_BUFFER_READ);
-	rx_edpkt_cfg_wq(intf, intf->rx_ring_dma, RX_EDPKT_RING_BUFFER_WRITE);
-	rx_edpkt_cfg_wq(intf, intf->rx_ring_dma, RX_EDPKT_RING_BUFFER_BASE);
-	rx_edpkt_cfg_wq(intf, intf->rx_ring_dma_valid, RX_EDPKT_RING_BUFFER_END);
-	rx_edpkt_cfg_wq(intf, intf->rx_ring_dma_valid, RX_EDPKT_RING_BUFFER_VALID);
-
-	/* EDPKT */
-	rx_edpkt_cfg_wl(intf, (RX_EDPKT_CFG_CFG0_RBUF_4K <<
-			RX_EDPKT_CFG_CFG0_DBUF_SHIFT) |
-		       (RX_EDPKT_CFG_CFG0_64_ALN <<
-			RX_EDPKT_CFG_CFG0_BALN_SHIFT) |
-		       (RX_EDPKT_CFG_CFG0_EFRM_STUF),
-			RX_EDPKT_CFG_CFG0);
-	rx_edpkt_dma_wq(intf, intf->rx_edpkt_dma, RX_EDPKT_DMA_WRITE);
-	rx_edpkt_dma_wq(intf, intf->rx_edpkt_dma, RX_EDPKT_DMA_READ);
-	rx_edpkt_dma_wq(intf, intf->rx_edpkt_dma, RX_EDPKT_DMA_BASE);
-	rx_edpkt_dma_wq(intf, intf->rx_edpkt_dma + (DESC_RING_SIZE - 1),
-			RX_EDPKT_DMA_END);
-	rx_edpkt_dma_wq(intf, intf->rx_edpkt_dma + (DESC_RING_SIZE - 1),
-			RX_EDPKT_DMA_VALID);
-
-	/* RX Unimac Init */
-	umac2fb_wl(intf, UMAC2FB_CFG_DEFAULT_EN |
-		  ((intf->channel + 13) << UMAC2FB_CFG_CHID_SHIFT) |
-		  (0xc << UMAC2FB_CFG_OK_SEND_SHIFT), UMAC2FB_CFG);
+	bcmasp_rx_reset_ring(intf);
 
 	return 0;
 
 free_rx_ring:
-	dma_unmap_page(kdev, intf->rx_ring_dma, RING_BUFFER_SIZE, DMA_FROM_DEVICE);
+	dma_unmap_page(kdev, intf->rx_ring_dma, RING_BUFFER_SIZE,
+		       DMA_FROM_DEVICE);
 	__free_pages(virt_to_page(intf->rx_ring_cpu), intf->rx_buf_order);
 
 	return ret;
@@ -561,32 +728,30 @@ static void bcmasp_reclaim_free_all_rx(struct bcmasp_intf *intf)
 	struct device *kdev = &intf->parent->pdev->dev;
 
 	dma_free_coherent(kdev, DESC_RING_SIZE, intf->rx_edpkt_cpu,
-			  intf->rx_edpkt_dma);
-	dma_unmap_page(kdev, intf->rx_ring_dma, RING_BUFFER_SIZE, DMA_FROM_DEVICE);
+			  intf->rx_edpkt_dma_addr);
+	dma_unmap_page(kdev, intf->rx_ring_dma, RING_BUFFER_SIZE,
+		       DMA_FROM_DEVICE);
 	__free_pages(virt_to_page(intf->rx_ring_cpu), intf->rx_buf_order);
 }
 
 static int bcmasp_init_tx(struct bcmasp_intf *intf)
 {
 	struct device *kdev = &intf->parent->pdev->dev;
-	struct net_device *ndev = intf->ndev;
 	void *p;
 	int ret;
 
-	p = dma_zalloc_coherent(kdev, DESC_RING_SIZE, &intf->tx_spb_dma,
+	p = dma_zalloc_coherent(kdev, DESC_RING_SIZE, &intf->tx_spb_dma_addr,
 				GFP_KERNEL);
-	if (!p) {
-		netdev_err(ndev, "Cannot allocate tx desc ring\n");
+	if (!p)
 		return -ENOMEM;
-	}
+
 	intf->tx_spb_cpu = p;
-	intf->tx_spb_dma_valid = intf->tx_spb_dma + DESC_RING_SIZE - 1;
-	intf->tx_spb_dma_read = intf->tx_spb_dma;
+	intf->tx_spb_dma_valid = intf->tx_spb_dma_addr + DESC_RING_SIZE - 1;
+	intf->tx_spb_dma_read = intf->tx_spb_dma_addr;
 
 	intf->tx_cbs = kcalloc(DESC_RING_COUNT, sizeof(struct bcmasp_tx_cb),
 			       GFP_KERNEL);
 	if (!intf->tx_cbs) {
-		netdev_err(ndev, "Cannot allocate tx CB\n");
 		ret = -ENOMEM;
 		goto free_tx_spb;
 	}
@@ -602,8 +767,6 @@ static int bcmasp_init_tx(struct bcmasp_intf *intf)
 	tx_spb_ctrl_wl(intf, 0x0, TX_SPB_CTRL_ENABLE);
 	tx_epkt_core_wl(intf, 0x0, TX_EPKT_C_CFG_MISC);
 
-	idma_trans_wl(intf, 0x100000, ACPUSS_CTRL_TRANS_INFO);
-
 	/* Tx SPB */
 	tx_spb_ctrl_wl(intf, ((intf->channel + 8) << TX_SPB_CTRL_XF_BID_SHIFT),
 		       TX_SPB_CTRL_XF_CTRL2);
@@ -611,8 +774,8 @@ static int bcmasp_init_tx(struct bcmasp_intf *intf)
 	tx_spb_top_wl(intf, 0x1e, TX_SPB_TOP_BLKOUT);
 	tx_spb_top_wl(intf, 0x0, TX_SPB_TOP_SPRE_BW_CTRL);
 
-	tx_spb_dma_wq(intf, intf->tx_spb_dma, TX_SPB_DMA_READ);
-	tx_spb_dma_wq(intf, intf->tx_spb_dma, TX_SPB_DMA_BASE);
+	tx_spb_dma_wq(intf, intf->tx_spb_dma_addr, TX_SPB_DMA_READ);
+	tx_spb_dma_wq(intf, intf->tx_spb_dma_addr, TX_SPB_DMA_BASE);
 	tx_spb_dma_wq(intf, intf->tx_spb_dma_valid, TX_SPB_DMA_END);
 	tx_spb_dma_wq(intf, intf->tx_spb_dma_valid, TX_SPB_DMA_VALID);
 
@@ -620,7 +783,7 @@ static int bcmasp_init_tx(struct bcmasp_intf *intf)
 
 free_tx_spb:
 	dma_free_coherent(kdev, DESC_RING_SIZE, intf->tx_spb_cpu,
-			  intf->tx_spb_dma);
+			  intf->tx_spb_dma_addr);
 
 	return ret;
 }
@@ -631,26 +794,64 @@ static void bcmasp_reclaim_free_all_tx(struct bcmasp_intf *intf)
 
 	/* Free descriptors */
 	dma_free_coherent(kdev, DESC_RING_SIZE, intf->tx_spb_cpu,
-			  intf->tx_spb_dma);
+			  intf->tx_spb_dma_addr);
 
 	/* Free cbs */
 	kfree(intf->tx_cbs);
 }
 
-static int bcmasp_netif_deinit(struct net_device *dev, bool stop_phy)
+static void bcmasp_ephy_enable_set(struct bcmasp_intf *intf, bool enable)
+{
+	u32 mask = RGMII_EPHY_CFG_IDDQ_BIAS | RGMII_EPHY_CFG_EXT_PWRDOWN |
+		   RGMII_EPHY_CFG_IDDQ_GLOBAL;
+	u32 reg;
+
+	reg = rgmii_rl(intf, RGMII_EPHY_CNTRL);
+	if (enable) {
+		reg &= ~RGMII_EPHY_CK25_DIS;
+		rgmii_wl(intf, reg, RGMII_EPHY_CNTRL);
+		mdelay(1);
+
+		reg &= ~mask;
+		reg |= RGMII_EPHY_RESET;
+		rgmii_wl(intf, reg, RGMII_EPHY_CNTRL);
+		mdelay(1);
+
+		reg &= ~RGMII_EPHY_RESET;
+	} else {
+		reg |= mask | RGMII_EPHY_RESET;
+		rgmii_wl(intf, reg, RGMII_EPHY_CNTRL);
+		mdelay(1);
+		reg |= RGMII_EPHY_CK25_DIS;
+	}
+	rgmii_wl(intf, reg, RGMII_EPHY_CNTRL);
+	mdelay(1);
+
+	/* Set or clear the LED control override to avoid lighting up LEDs
+	 * while the EPHY is powered off and drawing unnecessary current.
+	 */
+	reg = rgmii_rl(intf, RGMII_SYS_LED_CNTRL);
+	if (enable)
+		reg &= ~RGMII_SYS_LED_CNTRL_LINK_OVRD;
+	else
+		reg |= RGMII_SYS_LED_CNTRL_LINK_OVRD;
+	rgmii_wl(intf, reg, RGMII_SYS_LED_CNTRL);
+}
+
+static void bcmasp_netif_deinit(struct net_device *dev, bool stop_rx)
 {
 	struct bcmasp_intf *intf = netdev_priv(dev);
-
 	u32 reg, timeout = 1000;
+
 	napi_disable(&intf->tx_napi);
 
 	bcmasp_enable_tx(intf, 0);
 
 	/* Flush any TX packets in the pipe */
-	tx_spb_dma_wl(intf, 0x1, TX_SPB_DMA_FIFO_CTRL);
+	tx_spb_dma_wl(intf, TX_SPB_DMA_FIFO_FLUSH, TX_SPB_DMA_FIFO_CTRL);
 	do {
 		reg = tx_spb_dma_rl(intf, TX_SPB_DMA_FIFO_STATUS);
-		if (!(reg & 0x1))
+		if (!(reg & TX_SPB_DMA_FIFO_FLUSH))
 			break;
 		usleep_range(1000, 2000);
 	} while (timeout-- > 0);
@@ -658,16 +859,16 @@ static int bcmasp_netif_deinit(struct net_device *dev, bool stop_phy)
 
 	umac_enable_set(intf, UMC_CMD_TX_EN, 0);
 
-	if (stop_phy)
-		phy_stop(dev->phydev);
+	phy_stop(dev->phydev);
 
 	/* Shut down RX */
 	umac_enable_set(intf, UMC_CMD_RX_EN, 0);
 
-	/* Flush packets in pipe */
-	bcmasp_flush_rx_port(intf);
-	usleep_range(1000, 2000);
-	bcmasp_enable_rx(intf, 0);
+	if (stop_rx) {
+		bcmasp_flush_rx_port(intf);
+		usleep_range(1000, 2000);
+		bcmasp_enable_rx(intf, 0);
+	}
 
 	napi_disable(&intf->rx_napi);
 
@@ -676,29 +877,33 @@ static int bcmasp_netif_deinit(struct net_device *dev, bool stop_phy)
 	bcmasp_enable_rx_irq(intf, 0);
 
 	netif_napi_del(&intf->tx_napi);
-	netif_napi_del(&intf->rx_napi);
-
-	bcmasp_reclaim_free_all_rx(intf);
 	bcmasp_reclaim_free_all_tx(intf);
 
-	return 0;
+	if (stop_rx) {
+		netif_napi_del(&intf->rx_napi);
+		bcmasp_reclaim_free_all_rx(intf);
+	}
 }
 
 static int bcmasp_stop(struct net_device *dev)
 {
 	struct bcmasp_intf *intf = netdev_priv(dev);
-	int ret;
 
-	netif_dbg(intf, ifdown, dev, "bcmasp_close\n");
+	netif_dbg(intf, ifdown, dev, "%s\n", __func__);
 
 	/* Stop tx from updating HW */
 	netif_tx_disable(dev);
 
-	ret = bcmasp_netif_deinit(dev, true);
-	if (ret)
-		return ret;
+	bcmasp_netif_deinit(dev, true);
 
 	phy_disconnect(dev->phydev);
+
+	/* Disable internal EPHY */
+	if (intf->internal_phy)
+		bcmasp_ephy_enable_set(intf, false);
+
+	/* Disable the interface clocks */
+	bcmasp_core_clock_set_intf(intf, false);
 
 	clk_disable_unprepare(intf->parent->clk);
 
@@ -732,6 +937,9 @@ static void bcmasp_configure_port(struct bcmasp_intf *intf)
 		break;
 	}
 
+	if (intf->internal_phy)
+		reg |= RGMII_PORT_MODE_EPHY;
+
 	rgmii_wl(intf, reg, RGMII_PORT_CNTRL);
 
 	reg = rgmii_rl(intf, RGMII_OOB_CNTRL);
@@ -740,13 +948,72 @@ static void bcmasp_configure_port(struct bcmasp_intf *intf)
 	rgmii_wl(intf, reg, RGMII_OOB_CNTRL);
 }
 
-static int bcmasp_netif_init(struct net_device *dev, bool phy_connect)
+static int bcmasp_netif_init(struct net_device *dev, bool phy_connect,
+			     bool init_rx)
 {
 	struct bcmasp_intf *intf = netdev_priv(dev);
+	phy_interface_t phy_iface = intf->phy_interface;
+	u32 phy_flags = PHY_BRCM_AUTO_PWRDWN_ENABLE |
+			PHY_BRCM_DIS_TXCRXC_NOENRGY |
+			PHY_BRCM_IDDQ_SUSPEND;
 	struct phy_device *phydev = NULL;
 	int ret;
 
+	/* Always enable interface clocks */
+	bcmasp_core_clock_set_intf(intf, true);
+
+	/* Enable internal PHY before any MAC activity */
+	if (intf->internal_phy)
+		bcmasp_ephy_enable_set(intf, true);
+
 	bcmasp_configure_port(intf);
+
+	/* This is an ugly quirk but we have not been correctly interpreting
+	 * the phy_interface values and we have done that across different
+	 * drivers, so at least we are consistent in our mistakes.
+	 *
+	 * When the Generic PHY driver is in use either the PHY has been
+	 * strapped or programmed correctly by the boot loader so we should
+	 * stick to our incorrect interpretation since we have validated it.
+	 *
+	 * Now when a dedicated PHY driver is in use, we need to reverse the
+	 * meaning of the phy_interface_mode values to something that the PHY
+	 * driver will interpret and act on such that we have two mistakes
+	 * canceling themselves so to speak. We only do this for the two
+	 * modes that GENET driver officially supports on Broadcom STB chips:
+	 * PHY_INTERFACE_MODE_RGMII and PHY_INTERFACE_MODE_RGMII_TXID. Other
+	 * modes are not *officially* supported with the boot loader and the
+	 * scripted environment generating Device Tree blobs for those
+	 * platforms.
+	 *
+	 * Note that internal PHY and fixed-link configurations are not
+	 * affected because they use different phy_interface_t values or the
+	 * Generic PHY driver.
+	 */
+	switch (phy_iface) {
+	case PHY_INTERFACE_MODE_RGMII:
+		phy_iface = PHY_INTERFACE_MODE_RGMII_ID;
+		break;
+	case PHY_INTERFACE_MODE_RGMII_TXID:
+		phy_iface = PHY_INTERFACE_MODE_RGMII_RXID;
+		break;
+	default:
+		break;
+	}
+
+	if (phy_connect) {
+		phydev = of_phy_connect(dev, intf->phy_dn, bcmasp_adj_link,
+					phy_flags, phy_iface);
+		if (!phydev) {
+			ret = -ENODEV;
+			netdev_err(dev, "could not attach to PHY\n");
+			goto err_phy_disable;
+		}
+	} else if (!intf->wolopts) {
+		ret = phy_resume(dev->phydev);
+		if (ret)
+			goto err_phy_disable;
+	}
 
 	umac_reset(intf);
 
@@ -757,14 +1024,6 @@ static int bcmasp_netif_init(struct net_device *dev, bool phy_connect)
 
 	umac_set_hw_addr(intf, dev->dev_addr);
 
-	if (phy_connect) {
-		phydev = of_phy_connect(dev, intf->phy_dn, bcmasp_adj_link, 0,
-					intf->phy_interface);
-		if (!phydev) {
-			netdev_err(dev, "could not attach to PHY\n");
-			return -ENODEV;
-		}
-	}
 	intf->old_duplex = -1;
 	intf->old_link = -1;
 	intf->old_pause = -1;
@@ -773,18 +1032,28 @@ static int bcmasp_netif_init(struct net_device *dev, bool phy_connect)
 	if (ret)
 		goto err_phy_disconnect;
 
-	bcmasp_init_rx(intf);
-	if (ret)
-		goto err_reclaim_tx;
-
 	/* Turn on asp */
 	bcmasp_enable_tx(intf, 1);
-	bcmasp_enable_rx(intf, 1);
+
+	if (init_rx || phy_connect) {
+		ret = bcmasp_init_rx(intf);
+		if (ret)
+			goto err_reclaim_tx;
+		bcmasp_enable_rx(intf, 1);
+	} else if (!rx_edpkt_cfg_rl(intf, RX_EDPKT_CFG_ENABLE)) {
+		/* Do a partial init of RX if register state was reset */
+		bcmasp_rx_reset_ring(intf);
+		bcmasp_enable_rx(intf, 1);
+	}
 
 	/* Turn on UniMAC TX/RX */
 	umac_enable_set(intf, (UMC_CMD_RX_EN | UMC_CMD_TX_EN), 1);
 
+	intf->crc_fwd = !!(umac_rl(intf, UMC_CMD) & UMC_CMD_CRC_FWD);
+
 	bcmasp_netif_start(dev);
+
+	phy_start(dev->phydev);
 
 	netif_start_queue(dev);
 
@@ -795,6 +1064,9 @@ err_reclaim_tx:
 err_phy_disconnect:
 	if (phydev)
 		phy_disconnect(phydev);
+err_phy_disable:
+	if (intf->internal_phy)
+		bcmasp_ephy_enable_set(intf, false);
 	return ret;
 }
 
@@ -803,13 +1075,13 @@ static int bcmasp_open(struct net_device *dev)
 	struct bcmasp_intf *intf = netdev_priv(dev);
 	int ret;
 
-	netif_dbg(intf, ifup, dev, "bcmasp_open\n");
+	netif_dbg(intf, ifup, dev, "%s\n", __func__);
 
 	ret = clk_prepare_enable(intf->parent->clk);
 	if (ret)
 		return ret;
 
-	ret = bcmasp_netif_init(dev, true);
+	ret = bcmasp_netif_init(dev, true, true);
 	if (ret)
 		clk_disable_unprepare(intf->parent->clk);
 
@@ -838,7 +1110,7 @@ static void bcmasp_tx_timeout(struct net_device *dev)
 }
 
 static int bcmasp_get_phys_port_name(struct net_device *dev,
-				      char *name, size_t len)
+				     char *name, size_t len)
 {
 	struct bcmasp_intf *intf = netdev_priv(dev);
 
@@ -853,6 +1125,17 @@ static struct net_device_stats *bcmasp_get_stats(struct net_device *dev)
 	return &dev->stats;
 }
 
+static int bcmasp_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
+{
+	if (!netif_running(dev))
+		return -EINVAL;
+
+	if (!dev->phydev)
+		return -ENODEV;
+
+	return phy_mii_ioctl(dev->phydev, rq, cmd);
+}
+
 static const struct net_device_ops bcmasp_netdev_ops = {
 	.ndo_open		= bcmasp_open,
 	.ndo_stop		= bcmasp_stop,
@@ -861,26 +1144,36 @@ static const struct net_device_ops bcmasp_netdev_ops = {
 	.ndo_set_rx_mode	= bcmasp_set_rx_mode,
 	.ndo_get_phys_port_name	= bcmasp_get_phys_port_name,
 	.ndo_get_stats		= bcmasp_get_stats,
+	.ndo_do_ioctl		= bcmasp_ioctl,
 };
 
-static inline void  bcmasp_map_res(struct bcmasp_priv *priv,
-				    struct bcmasp_intf *intf)
+static inline void bcmasp_map_res(struct bcmasp_priv *priv,
+				  struct bcmasp_intf *intf)
 {
 	/* Per port */
 	intf->res.umac = priv->base + UMC_OFFSET(intf);
 	intf->res.umac2fb = priv->base + UMAC2FB_OFFSET(intf);
 	intf->res.rgmii = priv->base + RGMII_OFFSET(intf);
-	intf->res.idma_trans = priv->base + ACPUSS_CTRL_TRANS_OFFSET(intf);
 
 	/* Per ch */
-	intf->res.tx_spb_dma = priv->base + TX_SPB_DMA_OFFSET(intf);
+	intf->tx_spb_dma = priv->base + TX_SPB_DMA_OFFSET(intf);
 	intf->res.tx_spb_ctrl = priv->base + TX_SPB_CTRL_OFFSET(intf);
-	intf->res.tx_spb_top = priv->base + TX_SPB_TOP_OFFSET(intf);
+	/*
+	 * Stop gap solution. This should be removed when 72165a0 is
+	 * deprecated
+	 */
+	if (of_machine_is_compatible("brcm,bcm72165a0")) {
+		intf->res.tx_spb_top = priv->base +
+			TX_SPB_TOP_OFFSET_LEGACY(intf);
+	} else {
+		intf->res.tx_spb_top = priv->base +
+			TX_SPB_TOP_OFFSET(intf);
+	}
 	intf->res.tx_epkt_core = priv->base + TX_EPKT_C_OFFSET(intf);
 	intf->res.tx_pause_ctrl = priv->base + TX_PAUSE_CTRL_OFFSET(intf);
 
-	intf->res.rx_edpkt_dma = priv->base + RX_EDPKT_DMA_OFFSET(intf);
-	intf->res.rx_edpkt_cfg = priv->base + RX_EDPKT_CFG_OFFSET(intf);
+	intf->rx_edpkt_dma = priv->base + RX_EDPKT_DMA_OFFSET(intf);
+	intf->rx_edpkt_cfg = priv->base + RX_EDPKT_CFG_OFFSET(intf);
 }
 
 static irqreturn_t bcmasp_wol_isr(int irq, void *dev_id)
@@ -893,14 +1186,14 @@ static irqreturn_t bcmasp_wol_isr(int irq, void *dev_id)
 }
 
 struct bcmasp_intf *bcmasp_interface_create(struct bcmasp_priv *priv,
-					    struct device_node *ndev_dn,
-					    int wol_irq)
+					    struct device_node *ndev_dn)
 {
 	struct device *dev = &priv->pdev->dev;
+	const char *phy_mode_str = NULL;
 	struct bcmasp_intf *intf;
 	struct net_device *ndev;
 	const void *macaddr;
-	int ch, port, ret;
+	int ch, port, ret, wol_irq;
 
 	if (of_property_read_u32(ndev_dn, "reg", &port)) {
 		dev_warn(dev, "%s: invalid ch number\n", ndev_dn->name);
@@ -919,6 +1212,7 @@ struct bcmasp_intf *bcmasp_interface_create(struct bcmasp_priv *priv,
 	}
 	intf = netdev_priv(ndev);
 
+	wol_irq = platform_get_irq(priv->pdev, port + 1);
 	/* Interrupt is optional */
 	if (wol_irq > 0) {
 		intf->wol_irq_disabled = true;
@@ -938,17 +1232,28 @@ struct bcmasp_intf *bcmasp_interface_create(struct bcmasp_priv *priv,
 	intf->port = port;
 	intf->ndev_dn = ndev_dn;
 
-	intf->phy_interface = of_get_phy_mode(ndev_dn);
-	if (intf->phy_interface < 0)
+	ret = of_get_phy_mode(ndev_dn);
+	intf->phy_interface = ret;
+	if (ret < 0) {
+		ret = of_property_read_string(ndev_dn, "phy-mode", &phy_mode_str);
+		if (ret < 0) {
+			dev_err(dev, "invalid PHY mode property\n");
+			goto err_free_irq;
+		}
+
 		intf->phy_interface = PHY_INTERFACE_MODE_GMII;
+		if (!strcasecmp(phy_mode_str, "internal")) {
+			intf->internal_phy = true;
+			intf->phy_interface = PHY_INTERFACE_MODE_NA;
+		}
+	}
 
-        intf->phy_dn = of_parse_phandle(ndev_dn, "phy-handle", 0);
-
+	intf->phy_dn = of_parse_phandle(ndev_dn, "phy-handle", 0);
 	if (!intf->phy_dn && of_phy_is_fixed_link(ndev_dn)) {
 		ret = of_phy_register_fixed_link(ndev_dn);
 		if (ret) {
 			dev_warn(dev, "%s: failed to register fixed PHY\n",
-				ndev_dn->name);
+				 ndev_dn->name);
 			goto err_free_irq;
 		}
 		intf->phy_dn = ndev_dn;
@@ -957,10 +1262,12 @@ struct bcmasp_intf *bcmasp_interface_create(struct bcmasp_priv *priv,
 	/* Map resource */
 	bcmasp_map_res(priv, intf);
 
-	if (!phy_interface_mode_is_rgmii(intf->phy_interface) &&
-	    intf->phy_interface != PHY_INTERFACE_MODE_MII) {
-		netdev_err(intf->ndev, "invalid PHY mode: %s\n",
-			   phy_modes(intf->phy_interface));
+	if ((!phy_interface_mode_is_rgmii(intf->phy_interface) &&
+	    intf->phy_interface != PHY_INTERFACE_MODE_MII &&
+	    intf->phy_interface != PHY_INTERFACE_MODE_NA) ||
+	    (intf->port != 1 && intf->internal_phy)) {
+		netdev_err(intf->ndev, "invalid PHY mode: %s for port %d\n",
+			   phy_modes(intf->phy_interface), intf->port);
 		ret = -EINVAL;
 		goto err_free_irq;
 	}
@@ -982,6 +1289,10 @@ struct bcmasp_intf *bcmasp_interface_create(struct bcmasp_priv *priv,
 	intf->msg_enable = netif_msg_init(-1, NETIF_MSG_DRV |
 					  NETIF_MSG_PROBE |
 					  NETIF_MSG_LINK);
+	ndev->features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_SG |
+			  NETIF_F_RXCSUM;
+	ndev->hw_features |= ndev->features;
+	ndev->needed_headroom += sizeof(struct bcmasp_pkt_offload);
 
 	return intf;
 
@@ -1005,7 +1316,7 @@ void bcmasp_interface_destroy(struct bcmasp_intf *intf, bool unregister)
 	free_netdev(intf->ndev);
 }
 
-static int bcmasp_suspend_to_wol(struct bcmasp_intf *intf)
+static void bcmasp_suspend_to_wol(struct bcmasp_intf *intf)
 {
 	struct net_device *ndev = intf->ndev;
 	u32 reg;
@@ -1024,44 +1335,60 @@ static int bcmasp_suspend_to_wol(struct bcmasp_intf *intf)
 	}
 	umac_wl(intf, reg, UMC_MPD_CTRL);
 
+	if (intf->wolopts & WAKE_FILTER)
+		bcmasp_netfilt_suspend(intf);
+
 	/* UniMAC receive needs to be turned on */
 	umac_enable_set(intf, UMC_CMD_RX_EN, 1);
 
 	netif_dbg(intf, wol, ndev, "entered WOL mode\n");
-
-	return 0;
 }
 
-int bcmasp_interface_suspend(struct bcmasp_intf *intf)
+static inline bool bcmasp_needs_rx_on(struct bcmasp_intf *intf)
+{
+	return intf->wol_keep_rx_en && intf->wolopts
+	       && device_may_wakeup(&intf->parent->pdev->dev);
+}
+
+int bcmasp_interface_suspend(struct bcmasp_intf *intf, bool *wol_keep_rx_en)
 {
 	struct device *kdev = &intf->parent->pdev->dev;
 	struct net_device *dev = intf->ndev;
-	int ret;
+	bool keep_rx = bcmasp_needs_rx_on(intf);
+	int ret = 0;
 
 	if (!netif_running(dev))
 		return 0;
 
 	netif_device_detach(dev);
 
-	ret = bcmasp_netif_deinit(dev, false);
-	if (ret)
-		return ret;
+	bcmasp_netif_deinit(dev, !keep_rx);
 
-	if (!device_may_wakeup(kdev)) {
+	if (!intf->wolopts) {
 		ret = phy_suspend(dev->phydev);
 		if (ret)
 			goto out;
+
+		if (intf->internal_phy)
+			bcmasp_ephy_enable_set(intf, false);
+
+		/* If Wake-on-LAN is disabled, we can safely
+		 * disable the network interface clocks.
+		 */
+		bcmasp_core_clock_set_intf(intf, false);
 	}
 
 	if (device_may_wakeup(kdev) && intf->wolopts)
-		ret = bcmasp_suspend_to_wol(intf);
+		bcmasp_suspend_to_wol(intf);
 
 	clk_disable_unprepare(intf->parent->clk);
+
+	*wol_keep_rx_en |= keep_rx;
 
 	return ret;
 
 out:
-	bcmasp_netif_init(dev, false);
+	bcmasp_netif_init(dev, false, keep_rx);
 	return ret;
 }
 
@@ -1076,8 +1403,8 @@ static void bcmasp_resume_from_wol(struct bcmasp_intf *intf)
 
 int bcmasp_interface_resume(struct bcmasp_intf *intf)
 {
-	struct device *kdev = &intf->parent->pdev->dev;
 	struct net_device *dev = intf->ndev;
+	bool no_init_rx = bcmasp_needs_rx_on(intf);
 	int ret;
 
 	if (!netif_running(dev))
@@ -1087,24 +1414,19 @@ int bcmasp_interface_resume(struct bcmasp_intf *intf)
 	if (ret)
 		return ret;
 
-	bcmasp_resume_from_wol(intf);
-
-	ret = bcmasp_netif_init(dev, false);
+	ret = bcmasp_netif_init(dev, false, !no_init_rx);
 	if (ret)
 		goto out;
 
-	if (!device_may_wakeup(kdev)) {
-		ret = phy_resume(dev->phydev);
-		if (ret)
-			goto out_phy_resume;
-	}
+	bcmasp_resume_from_wol(intf);
+
+	if (intf->eee.eee_enabled)
+		bcmasp_eee_enable_set(intf, true);
 
 	netif_device_attach(dev);
 
 	return 0;
 
-out_phy_resume:
-	bcmasp_netif_deinit(dev, false);
 out:
 	clk_disable_unprepare(intf->parent->clk);
 	return ret;

@@ -671,7 +671,8 @@ static u32 moca_irq_status(struct moca_priv_data *priv, int flush)
 	if (moca_is_20(priv))
 		dma_mask |= M2H_NEXTCHUNK_CPU0;
 
-	spin_lock_irqsave(&priv->irq_status_lock, flags);
+	if (priv->moca_ops->dma)
+		spin_lock_irqsave(&priv->irq_status_lock, flags);
 
 	stat = MOCA_RD(priv->base + priv->regs->l2_status_offset);
 
@@ -696,7 +697,8 @@ static u32 moca_irq_status(struct moca_priv_data *priv, int flush)
 		MOCA_RD(priv->base + r->l2_clear_offset);
 	}
 
-	spin_unlock_irqrestore(&priv->irq_status_lock, flags);
+	if (priv->moca_ops->dma)
+		spin_unlock_irqrestore(&priv->irq_status_lock, flags);
 
 	return stat;
 }
@@ -1119,7 +1121,7 @@ static int moca_recvmsg(struct moca_priv_data *priv, uintptr_t offset,
 	struct moca_core_msg *m;
 	unsigned int w, rw, num_ies;
 	u32 data, size;
-	char *msg;
+	char *msg = NULL;
 	int err = -ENOMEM;
 	u32 *reply = priv->core_resp_buf;
 	int attach = 1;
@@ -1311,7 +1313,8 @@ static int moca_recvmsg(struct moca_priv_data *priv, uintptr_t offset,
 	return 0;
 
 bad:
-	dev_warn(priv->dev, "%s\n", msg);
+	if (msg)
+		dev_warn(priv->dev, "%s\n", msg);
 
 	if (ml)
 		moca_attach_tail(priv, ml, &priv->core_msg_free_list);

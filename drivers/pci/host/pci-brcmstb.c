@@ -10,6 +10,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  */
+#include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/compiler.h>
 #include <linux/delay.h>
@@ -18,11 +19,13 @@
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/irqdomain.h>
+#include <linux/kdebug.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/log2.h>
 #include <linux/module.h>
 #include <linux/msi.h>
+#include <linux/notifier.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/of_pci.h>
@@ -154,6 +157,39 @@
 #define PCIE_DVT_PMU_PCIE_PHY_CTRL_DEASSERT_PWRDN_MASK		0x1
 #define PCIE_DVT_PMU_PCIE_PHY_CTRL_DEASSERT_PWRDN_SHIFT		0x0
 
+#define PCIE_OUTB_ERR_TREAT				0x6000
+#define  PCIE_OUTB_ERR_TREAT_CONFIG_MASK		0x1
+#define  PCIE_OUTB_ERR_TREAT_MEM_MASK			0x2
+#define PCIE_OUTB_ERR_VALID				0x6004
+#define PCIE_OUTB_ERR_CLEAR				0x6008
+#define PCIE_OUTB_ERR_ACC_INFO				0x600c
+#define  PCIE_OUTB_ERR_ACC_INFO_CFG_ERR_MASK		0x01
+#define  PCIE_OUTB_ERR_ACC_INFO_MEM_ERR_MASK		0x02
+#define  PCIE_OUTB_ERR_ACC_INFO_TYPE_64_MASK		0x04
+#define  PCIE_OUTB_ERR_ACC_INFO_DIR_WRITE_MASK		0x10
+#define  PCIE_OUTB_ERR_ACC_INFO_BYTE_LANES_MASK		0xff00
+#define PCIE_OUTB_ERR_ACC_ADDR				0x6010
+#define PCIE_OUTB_ERR_ACC_ADDR_BUS_MASK			0xff00000
+#define PCIE_OUTB_ERR_ACC_ADDR_DEV_MASK			0xf8000
+#define PCIE_OUTB_ERR_ACC_ADDR_FUNC_MASK		0x7000
+#define PCIE_OUTB_ERR_ACC_ADDR_REG_MASK			0xfff
+#define PCIE_OUTB_ERR_CFG_CAUSE				0x6014
+#define  PCIE_OUTB_ERR_CFG_CAUSE_TIMEOUT_MASK		0x40
+#define  PCIE_OUTB_ERR_CFG_CAUSE_ABORT_MASK		0x20
+#define  PCIE_OUTB_ERR_CFG_CAUSE_UNSUPP_REQ_MASK	0x10
+#define  PCIE_OUTB_ERR_CFG_CAUSE_ACC_TIMEOUT_MASK	0x4
+#define  PCIE_OUTB_ERR_CFG_CAUSE_ACC_DISABLED_MASK	0x2
+#define  PCIE_OUTB_ERR_CFG_CAUSE_ACC_64BIT__MASK	0x1
+#define PCIE_OUTB_ERR_MEM_ADDR_LO			0x6018
+#define PCIE_OUTB_ERR_MEM_ADDR_HI			0x601c
+#define PCIE_OUTB_ERR_MEM_CAUSE				0x6020
+#define  PCIE_OUTB_ERR_MEM_CAUSE_TIMEOUT_MASK		0x40
+#define  PCIE_OUTB_ERR_MEM_CAUSE_ABORT_MASK		0x20
+#define  PCIE_OUTB_ERR_MEM_CAUSE_UNSUPP_REQ_MASK	0x10
+#define  PCIE_OUTB_ERR_MEM_CAUSE_ACC_DISABLED_MASK	0x2
+#define  PCIE_OUTB_ERR_MEM_CAUSE_BAD_ADDR_MASK		0x1
+
+
 #define BRCM_NUM_PCI_OUT_WINS		0x4
 #define BRCM_MAX_SCB			0x4
 #define MAX_PCIE			0x4
@@ -258,6 +294,7 @@ struct pcie_cfg_data {
 	const int *reg_field_info;
 	const int *offsets;
 	const enum pcie_type type;
+	const bool has_err_report;
 };
 
 static const int pcie_reg_field_info[] = {
@@ -310,6 +347,13 @@ static const struct pcie_cfg_data bcm7278_cfg = {
 	.reg_field_info = pcie_reg_field_info_bcm7278,
 	.offsets	= pcie_offset_bcm7278,
 	.type		= BCM7278,
+};
+
+static const struct pcie_cfg_data bcm7216_cfg = {
+	.reg_field_info = pcie_reg_field_info_bcm7278,
+	.offsets	= pcie_offset_bcm7278,
+	.type		= BCM7278,
+	.has_err_report = true,
 };
 
 static void __iomem *brcm_pci_map_cfg(struct pci_bus *bus, unsigned int devfn,
@@ -370,7 +414,9 @@ struct brcm_pcie {
 	struct pci_bus		*bus;
 	int			id;
 	bool			ep_wakeup_capable;
+	bool			has_err_report;
 	struct reset_control	*rescal;
+	struct notifier_block	die_notifier;
 };
 
 struct of_pci_range *dma_ranges;
@@ -907,7 +953,8 @@ static void brcm_pcie_setup_prep(struct brcm_pcie *pcie)
 	pcie->rev = EXTRACT_FIELD(tmp, PCIE_MISC_REVISION, MAJMIN);
 
 	/* Set SCB_MAX_BURST_SIZE, CFG_READ_UR_MODE, SCB_ACCESS_EN */
-	tmp = INSERT_FIELD(0, PCIE_MISC_MISC_CTRL, SCB_ACCESS_EN, 1);
+	tmp = bcm_readl(base + PCIE_MISC_MISC_CTRL);
+	tmp = INSERT_FIELD(tmp, PCIE_MISC_MISC_CTRL, SCB_ACCESS_EN, 1);
 	tmp = INSERT_FIELD(tmp, PCIE_MISC_MISC_CTRL, CFG_READ_UR_MODE, 1);
 	burst = (pcie->type == GENERIC || pcie->type == BCM7278)
 		? BURST_SIZE_512 : BURST_SIZE_256;
@@ -1127,11 +1174,6 @@ static int brcm_pcie_setup_bridge(struct brcm_pcie *pcie)
 	WR_FLD_RB(base, PCIE_RC_CFG_VENDOR_VENDOR_SPECIFIC_REG1,
 		  ENDIAN_MODE_BAR2, DATA_ENDIAN);
 
-	/* Refclk from RC should be gated with CLKREQ# input when ASPM L0s,L1
-	 * is enabled =>  setting the CLKREQ_DEBUG_ENABLE field to 1.
-	 */
-	WR_FLD_RB(base, PCIE_MISC_HARD_PCIE_HARD_DEBUG, CLKREQ_DEBUG_ENABLE, 1);
-
 	pcie->bridge_setup_done = true;
 
 	return 0;
@@ -1216,6 +1258,34 @@ static void turn_off(struct brcm_pcie *pcie)
 	brcm_pcie_bridge_sw_init_set(pcie, 1);
 }
 
+void config_clkreq(struct brcm_pcie *pcie)
+{
+	void __iomem *base = pcie->base;
+	int domain = pci_domain_nr(pcie->bus);
+	const struct pci_bus *bus = pci_find_bus(domain, 1);
+	struct pci_dev *pdev;
+	u32 link_cap = 0;
+	u16 link_ctl = 0;
+
+	pdev = bus ? (struct pci_dev *)bus->devices.next : NULL;
+	if (!pdev)
+		return;
+
+	pcie_capability_read_dword(pdev, PCI_EXP_LNKCAP, &link_cap);
+	if (!(link_cap & PCI_EXP_LNKCAP_CLKPM))
+		return;
+
+	pcie_capability_read_word(pdev, PCI_EXP_LNKCTL, &link_ctl);
+	if (!(link_ctl & PCI_EXP_LNKCTL_CLKREQ_EN))
+		return;
+	/*
+	 * Refclk from RC should be gated with CLKREQ# input when ASPM L0s,L1
+	 * is enabled => setting the CLKREQ_DEBUG_ENABLE field to 1.
+	 */
+	WR_FLD_RB(base, PCIE_MISC_HARD_PCIE_HARD_DEBUG, CLKREQ_DEBUG_ENABLE, 1);
+	dev_info(pcie->dev, "clkreq control enabled\n");
+}
+
 static int brcm_pcie_suspend(struct device *dev)
 {
 	struct brcm_pcie *pcie = dev_get_drvdata(dev);
@@ -1271,6 +1341,7 @@ static int brcm_pcie_resume(struct device *dev)
 	if (pcie->msi && pcie->msi_internal)
 		brcm_msi_set_regs(pcie->msi);
 
+	config_clkreq(pcie);
 	pcie->suspended = false;
 
 	return 0;
@@ -1404,6 +1475,84 @@ cleanup:
 	return -ENOMEM;
 }
 
+/*
+ * Dump out pcie errors on die or panic.
+ */
+static int dump_pcie_error(struct notifier_block *self, unsigned long v, void *p)
+{
+	const struct brcm_pcie *pcie = container_of(self, struct brcm_pcie, die_notifier);
+	void __iomem *base = pcie->base;
+	int i, is_cfg_err, is_mem_err, lanes;
+	char *width_str, *direction_str, lanes_str[9];
+	u32 info;
+
+	if (bcm_readl(base + PCIE_OUTB_ERR_VALID) == 0)
+		return NOTIFY_DONE;
+	info = bcm_readl(base + PCIE_OUTB_ERR_ACC_INFO);
+
+	is_cfg_err = !!(info & PCIE_OUTB_ERR_ACC_INFO_CFG_ERR_MASK);
+	is_mem_err = !!(info & PCIE_OUTB_ERR_ACC_INFO_MEM_ERR_MASK);
+	width_str = (info & PCIE_OUTB_ERR_ACC_INFO_TYPE_64_MASK) ? "64bit" : "32bit";
+	direction_str = (info & PCIE_OUTB_ERR_ACC_INFO_DIR_WRITE_MASK) ? "Write" : "Read";
+	lanes = FIELD_GET(PCIE_OUTB_ERR_ACC_INFO_BYTE_LANES_MASK, info);
+	for (i = 0, lanes_str[8] = 0; i < 8; i++)
+		lanes_str[i] = (lanes & (1 << i)) ? '1' : '0';
+
+	if (is_cfg_err) {
+		u32 cfg_addr = bcm_readl(base + PCIE_OUTB_ERR_ACC_ADDR);
+		u32 cause = bcm_readl(base + PCIE_OUTB_ERR_CFG_CAUSE);
+		int bus = FIELD_GET(PCIE_OUTB_ERR_ACC_ADDR_BUS_MASK, cfg_addr);
+		int dev = FIELD_GET(PCIE_OUTB_ERR_ACC_ADDR_DEV_MASK, cfg_addr);
+		int func = FIELD_GET(PCIE_OUTB_ERR_ACC_ADDR_FUNC_MASK, cfg_addr);
+		int reg = FIELD_GET(PCIE_OUTB_ERR_ACC_ADDR_REG_MASK, cfg_addr);
+
+		dev_err(pcie->dev, "Error: CFG Acc, %s, %s, Bus=%d, Dev=%d, Fun=%d, Reg=0x%x, lanes=%s\n",
+			width_str, direction_str, bus, dev, func, reg, lanes_str);
+		dev_err(pcie->dev, " Type: TO=%d Abt=%d UnsupReq=%d AccTO=%d AccDsbld=%d Acc64bit=%d\n",
+			!!(cause & PCIE_OUTB_ERR_CFG_CAUSE_TIMEOUT_MASK),
+			!!(cause & PCIE_OUTB_ERR_CFG_CAUSE_ABORT_MASK),
+			!!(cause & PCIE_OUTB_ERR_CFG_CAUSE_UNSUPP_REQ_MASK),
+			!!(cause & PCIE_OUTB_ERR_CFG_CAUSE_ACC_TIMEOUT_MASK),
+			!!(cause & PCIE_OUTB_ERR_CFG_CAUSE_ACC_DISABLED_MASK),
+			!!(cause & PCIE_OUTB_ERR_CFG_CAUSE_ACC_64BIT__MASK));
+	}
+
+	if (is_mem_err) {
+		u32 cause = bcm_readl(base + PCIE_OUTB_ERR_MEM_CAUSE);
+		u32 lo = bcm_readl(base + PCIE_OUTB_ERR_MEM_ADDR_LO);
+		u32 hi = bcm_readl(base + PCIE_OUTB_ERR_MEM_ADDR_HI);
+		u64 addr = ((u64)hi << 32) | (u64)lo;
+
+		dev_err(pcie->dev, "Error: Mem Acc, %s, %s, @0x%llx, lanes=%s\n",
+			width_str, direction_str, addr, lanes_str);
+		dev_err(pcie->dev, " Type: TO=%d Abt=%d UnsupReq=%d AccDsble=%d BadAddr=%d\n",
+			!!(cause & PCIE_OUTB_ERR_MEM_CAUSE_TIMEOUT_MASK),
+			!!(cause & PCIE_OUTB_ERR_MEM_CAUSE_ABORT_MASK),
+			!!(cause & PCIE_OUTB_ERR_MEM_CAUSE_UNSUPP_REQ_MASK),
+			!!(cause & PCIE_OUTB_ERR_MEM_CAUSE_ACC_DISABLED_MASK),
+			!!(cause & PCIE_OUTB_ERR_MEM_CAUSE_BAD_ADDR_MASK));
+	}
+
+	/* Clear the error */
+	bcm_writel(1, base + PCIE_OUTB_ERR_CLEAR);
+
+	return NOTIFY_DONE;
+}
+
+static void brcm_register_die_notifiers(struct brcm_pcie *pcie)
+{
+	pcie->die_notifier.notifier_call = dump_pcie_error;
+	register_die_notifier(&pcie->die_notifier);
+	atomic_notifier_chain_register(&panic_notifier_list, &pcie->die_notifier);
+}
+
+static void brcm_unregister_die_notifiers(struct brcm_pcie *pcie)
+{
+	unregister_die_notifier(&pcie->die_notifier);
+	atomic_notifier_chain_unregister(&panic_notifier_list, &pcie->die_notifier);
+	pcie->die_notifier.notifier_call = NULL;
+}
+
 static void __attribute__((__section__("pci_fixup_early")))
 brcm_pcibios_fixup(struct pci_dev *dev)
 {
@@ -1436,7 +1585,7 @@ static const struct of_device_id brcm_pci_match[] = {
 	{ .compatible = "brcm,bcm7425-pcie", .data = &bcm7425_cfg },
 	{ .compatible = "brcm,bcm7435-pcie", .data = &bcm7435_cfg },
 	{ .compatible = "brcm,bcm7278-pcie", .data = &bcm7278_cfg },
-	{ .compatible = "brcm,bcm7216-pcie", .data = &bcm7278_cfg },
+	{ .compatible = "brcm,bcm7216-pcie", .data = &bcm7216_cfg },
 	{ .compatible = "brcm,bcm7211-pcie", .data = &generic_cfg },
 	{ .compatible = "brcm,pci-plat-dev", .data = &generic_cfg },
 	{},
@@ -1499,6 +1648,7 @@ static int brcm_pcie_probe(struct platform_device *pdev)
 	pcie->type = data->type;
 	pcie->dn = dn;
 	pcie->dev = &pdev->dev;
+	pcie->has_err_report = data->has_err_report;
 
 	pcie->clk = of_clk_get_by_name(dn, "sw_pcie");
 	if (IS_ERR(pcie->clk)) {
@@ -1638,6 +1788,9 @@ static int brcm_pcie_probe(struct platform_device *pdev)
 		pcie_bus_configure_settings(child);
 	pci_bus_add_devices(pcie->bus);
 	platform_set_drvdata(pdev, pcie);
+	if (pcie->has_err_report)
+		brcm_register_die_notifiers(pcie);
+	config_clkreq(pcie);
 
 	return 0;
 
@@ -1651,6 +1804,8 @@ static int brcm_pcie_remove(struct platform_device *pdev)
 	struct brcm_pcie *pcie = platform_get_drvdata(pdev);
 
 	pci_stop_root_bus(pcie->bus);
+	if (pcie->has_err_report)
+		brcm_unregister_die_notifiers(pcie);
 	pci_remove_root_bus(pcie->bus);
 	pcie->bus = NULL;
 	_brcm_pcie_remove(pcie);

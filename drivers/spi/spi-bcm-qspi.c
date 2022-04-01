@@ -114,6 +114,7 @@
 #define MSPI_MASTER_BIT			BIT(7)
 
 #define MSPI_NUM_CDRAM				16
+#define MSPI_CDRAM_OUTP				BIT(8)
 #define MSPI_CDRAM_CONT_BIT			BIT(7)
 #define MSPI_CDRAM_BITSE_BIT			BIT(6)
 #define MSPI_CDRAM_DT_BIT			BIT(5)
@@ -128,6 +129,8 @@
 #define MSPI_SPCR3_DAM_8BYTE			0
 #define MSPI_SPCR3_DAM_16BYTE			(BIT(2) | BIT(4))
 #define MSPI_SPCR3_DAM_32BYTE			(BIT(3) | BIT(5))
+#define MSPI_SPCR3_HALFDUPLEX			BIT(6)
+#define MSPI_SPCR3_HDOUTTYPE			BIT(7)
 #define MSPI_SPCR3_DATA_REG_SZ			BIT(8)
 #define MSPI_SPCR3_CPHARX			BIT(9)
 #define MSPI_SPCR3_SYSCLKSEL_MASK		GENMASK(11, 10)
@@ -290,9 +293,21 @@ static inline bool bcm_qspi_has_sysclk_108(struct bcm_qspi *qspi)
 static inline int bcm_qspi_spbr_min(struct bcm_qspi *qspi)
 {
 	if (bcm_qspi_has_fastbr(qspi))
-		return 1;
+		return (bcm_qspi_has_sysclk_108(qspi) ? 4 : 1);
 	else
 		return 8;
+}
+
+static u32 bcm_qspi_calc_spbr(u32 clk_speed_hz,
+			      const struct bcm_qspi_parms *xp)
+{
+	u32 spbr = 0;
+
+	/* SPBR = System Clock/(2 * SCK Baud Rate) */
+	if (xp->speed_hz)
+		spbr = clk_speed_hz / (xp->speed_hz * 2);
+
+	return spbr;
 }
 
 /* Read qspi controller register*/
@@ -608,7 +623,7 @@ static void bcm_qspi_chip_select(struct bcm_qspi *qspi, int cs)
 	u32 rd = 0;
 	u32 wr = 0;
 
-	if (qspi->base[CHIP_SELECT]) {
+	if (cs >= 0 && qspi->base[CHIP_SELECT]) {
 		rd = bcm_qspi_read(qspi, CHIP_SELECT, 0);
 		wr = (rd & ~0xff) | (1 << cs);
 		if (rd == wr)
@@ -621,17 +636,22 @@ static void bcm_qspi_chip_select(struct bcm_qspi *qspi, int cs)
 	qspi->curr_cs = cs;
 }
 
+static bool bcmspi_parms_did_change(const struct bcm_qspi_parms * const cur,
+				    const struct bcm_qspi_parms * const prev)
+{
+	return (cur->speed_hz != prev->speed_hz) ||
+		(cur->mode != prev->mode) ||
+		(cur->bits_per_word != prev->bits_per_word);
+}
+
 /* MSPI helpers */
 static void bcm_qspi_hw_set_parms(struct bcm_qspi *qspi,
 				  const struct bcm_qspi_parms *xp)
 {
 	u32 spcr, spbr = 0;
 
-	if (xp->speed_hz)
-		spbr = qspi->base_clk / (2 * xp->speed_hz);
-
-	spcr = clamp_val(spbr, bcm_qspi_spbr_min(qspi), QSPI_SPBR_MAX);
-	bcm_qspi_write(qspi, MSPI, MSPI_SPCR0_LSB, spcr);
+	if (!bcmspi_parms_did_change(xp, &qspi->last_parms))
+		return;
 
 	if (!qspi->mspi_maj_rev)
 		/* legacy controller */
@@ -655,15 +675,24 @@ static void bcm_qspi_hw_set_parms(struct bcm_qspi *qspi,
 	if (bcm_qspi_has_fastbr(qspi)) {
 		spcr = 0;
 
-		/* enable fastdt, fastbr  */
-		spcr |=	MSPI_SPCR3_FASTBR | MSPI_SPCR3_FASTDT;
+		/* enable fastbr  */
+		spcr |=	MSPI_SPCR3_FASTBR;
+
+		if (xp->mode & SPI_3WIRE)
+			spcr |= MSPI_SPCR3_HALFDUPLEX |  MSPI_SPCR3_HDOUTTYPE;
 
 		if (bcm_qspi_has_sysclk_108(qspi)) {
-			/* SYSCLK_108 */
-			spcr |= MSPI_SPCR3_SYSCLKSEL_108;
-			qspi->base_clk = MSPI_BASE_FREQ * 4;
-			/* Change spbr as we changed sysclk */
-			bcm_qspi_write(qspi, MSPI, MSPI_SPCR0_LSB, 4);
+			/* check requested baud rate before moving to 108Mhz */
+			spbr = bcm_qspi_calc_spbr(MSPI_BASE_FREQ * 4, xp);
+			if (spbr > QSPI_SPBR_MAX) {
+				/* use SYSCLK_27Mhz for slower baud rates */
+				spcr &= ~MSPI_SPCR3_SYSCLKSEL_MASK;
+				qspi->base_clk = MSPI_BASE_FREQ;
+			} else {
+				/* SYSCLK_108Mhz */
+				spcr |= MSPI_SPCR3_SYSCLKSEL_108;
+				qspi->base_clk = MSPI_BASE_FREQ * 4;
+			}
 		}
 
 		if (xp->bits_per_word > 16) {
@@ -686,10 +715,16 @@ static void bcm_qspi_hw_set_parms(struct bcm_qspi *qspi,
 			 * TxRx RAM access mode 8B
 			 * and disable fastdt
 			 */
-			spcr &= ~(MSPI_SPCR3_FASTDT | MSPI_SPCR3_DAM_32BYTE);
+			spcr &= ~(MSPI_SPCR3_DAM_32BYTE);
 			bcm_qspi_write(qspi, MSPI, MSPI_SPCR3, spcr);
 		}
 	}
+
+	/* SCK Baud Rate = System Clock/(2 * SPBR) */
+	qspi->max_speed_hz = qspi->base_clk / (bcm_qspi_spbr_min(qspi) * 2);
+	spbr = bcm_qspi_calc_spbr(qspi->base_clk, xp);
+	spbr = clamp_val(spbr, bcm_qspi_spbr_min(qspi), QSPI_SPBR_MAX);
+	bcm_qspi_write(qspi, MSPI, MSPI_SPCR0_LSB, spbr);
 
 	qspi->last_parms = *xp;
 }
@@ -983,6 +1018,10 @@ static int write_to_hw(struct bcm_qspi *qspi, struct spi_device *spi)
 		mspi_cdram |= ((tp.trans->bits_per_word <= 8) ? 0 :
 			       MSPI_CDRAM_BITSE_BIT);
 
+		/* set 3wrire halfduplex mode data from master to slave */
+		if ((spi->mode & SPI_3WIRE) && tp.trans->tx_buf)
+			mspi_cdram |= MSPI_CDRAM_OUTP;
+
 		if (has_bspi(qspi))
 			mspi_cdram &= ~1;
 		else
@@ -1200,6 +1239,11 @@ static int bcm_qspi_flash_read(struct spi_device *spi,
 	addr = msg->from;
 	len = msg->len;
 
+	if (!has_bspi(qspi)) {
+		mspi_read = true;
+		goto mspi_flash_read;
+	}
+
 	if (bcm_qspi_bspi_ver_three(qspi) == true) {
 		/*
 		 * The address coming into this function is a raw flash offset.
@@ -1219,6 +1263,7 @@ static int bcm_qspi_flash_read(struct spi_device *spi,
 	    len < 4)
 		mspi_read = true;
 
+mspi_flash_read:
 	if (mspi_read)
 		return bcm_qspi_mspi_flash_read(spi, msg);
 
@@ -1420,10 +1465,14 @@ static void bcm_qspi_hw_init(struct bcm_qspi *qspi)
 
 static void bcm_qspi_hw_uninit(struct bcm_qspi *qspi)
 {
+	u32 status = bcm_qspi_read(qspi, MSPI, MSPI_MSPI_STATUS);
+
 	bcm_qspi_write(qspi, MSPI, MSPI_SPCR2, 0);
 	if (has_bspi(qspi))
 		bcm_qspi_write(qspi, MSPI, MSPI_WRITE_LOCK, 0);
 
+	/* clear interrupt */
+	bcm_qspi_write(qspi, MSPI, MSPI_MSPI_STATUS, status & ~1);
 }
 
 struct bcm_qspi_data {
@@ -1500,7 +1549,7 @@ int bcm_qspi_probe(struct platform_device *pdev,
 
 	data = of_id->data;
 
-	master = spi_alloc_master(dev, sizeof(struct bcm_qspi));
+	master = devm_spi_alloc_master(dev, sizeof(struct bcm_qspi));
 	if (!master) {
 		dev_err(dev, "error allocating spi_master\n");
 		return -ENOMEM;
@@ -1522,7 +1571,8 @@ int bcm_qspi_probe(struct platform_device *pdev,
 	}
 
 	master->bus_num = -1;
-	master->mode_bits = SPI_CPHA | SPI_CPOL | SPI_RX_DUAL | SPI_RX_QUAD;
+	master->mode_bits = SPI_CPHA | SPI_CPOL | SPI_RX_DUAL | SPI_RX_QUAD |
+				SPI_3WIRE;
 	master->setup = bcm_qspi_setup;
 	master->transfer_one = bcm_qspi_transfer_one;
 	master->spi_flash_read = bcm_qspi_flash_read;
@@ -1542,21 +1592,17 @@ int bcm_qspi_probe(struct platform_device *pdev,
 
 	if (res) {
 		qspi->base[MSPI]  = devm_ioremap_resource(dev, res);
-		if (IS_ERR(qspi->base[MSPI])) {
-			ret = PTR_ERR(qspi->base[MSPI]);
-			goto qspi_resource_err;
-		}
+		if (IS_ERR(qspi->base[MSPI]))
+			return PTR_ERR(qspi->base[MSPI]);
 	} else {
-		goto qspi_resource_err;
+		return 0;
 	}
 
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "bspi");
 	if (res) {
 		qspi->base[BSPI]  = devm_ioremap_resource(dev, res);
-		if (IS_ERR(qspi->base[BSPI])) {
-			ret = PTR_ERR(qspi->base[BSPI]);
-			goto qspi_resource_err;
-		}
+		if (IS_ERR(qspi->base[BSPI]))
+			return PTR_ERR(qspi->base[BSPI]);
 		qspi->bspi_mode = true;
 	} else {
 		qspi->bspi_mode = false;
@@ -1567,54 +1613,14 @@ int bcm_qspi_probe(struct platform_device *pdev,
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "cs_reg");
 	if (res) {
 		qspi->base[CHIP_SELECT]  = devm_ioremap_resource(dev, res);
-		if (IS_ERR(qspi->base[CHIP_SELECT])) {
-			ret = PTR_ERR(qspi->base[CHIP_SELECT]);
-			goto qspi_resource_err;
-		}
+		if (IS_ERR(qspi->base[CHIP_SELECT]))
+			return PTR_ERR(qspi->base[CHIP_SELECT]);
 	}
 
 	qspi->dev_ids = kcalloc(num_irqs, sizeof(struct bcm_qspi_dev_id),
 				GFP_KERNEL);
-	if (!qspi->dev_ids) {
-		ret = -ENOMEM;
-		goto qspi_resource_err;
-	}
-
-	for (val = 0; val < num_irqs; val++) {
-		irq = -1;
-		name = qspi_irq_tab[val].irq_name;
-		if (qspi_irq_tab[val].irq_source == SINGLE_L2) {
-			/* get the l2 interrupts */
-			irq = platform_get_irq_byname(pdev, name);
-		} else if (!num_ints && soc_intc) {
-			/* all mspi, bspi intrs muxed to one L1 intr */
-			irq = platform_get_irq(pdev, 0);
-		}
-
-		if (irq  >= 0) {
-			ret = devm_request_irq(&pdev->dev, irq,
-					       qspi_irq_tab[val].irq_handler, 0,
-					       name,
-					       &qspi->dev_ids[val]);
-			if (ret < 0) {
-				dev_err(&pdev->dev, "IRQ %s not found\n", name);
-				goto qspi_probe_err;
-			}
-
-			qspi->dev_ids[val].dev = qspi;
-			qspi->dev_ids[val].irqp = &qspi_irq_tab[val];
-			num_ints++;
-			dev_dbg(&pdev->dev, "registered IRQ %s %d\n",
-				qspi_irq_tab[val].irq_name,
-				irq);
-		}
-	}
-
-	if (!num_ints) {
-		dev_err(&pdev->dev, "no IRQs registered, cannot init driver\n");
-		ret = -EINVAL;
-		goto qspi_probe_err;
-	}
+	if (!qspi->dev_ids)
+		return -ENOMEM;
 
 	/*
 	 * Some SoCs integrate spi controller (e.g., its interrupt bits)
@@ -1651,6 +1657,48 @@ int bcm_qspi_probe(struct platform_device *pdev,
 
 	qspi->max_speed_hz = qspi->base_clk / (bcm_qspi_spbr_min(qspi) * 2);
 
+	/*
+	 * On SW resets it is possible to have the mask still enabled
+	 * Need to disable the mask and clear the status while we init
+	 */
+	bcm_qspi_hw_uninit(qspi);
+
+	for (val = 0; val < num_irqs; val++) {
+		irq = -1;
+		name = qspi_irq_tab[val].irq_name;
+		if (qspi_irq_tab[val].irq_source == SINGLE_L2) {
+			/* get the l2 interrupts */
+			irq = platform_get_irq_byname(pdev, name);
+		} else if (!num_ints && soc_intc) {
+			/* all mspi, bspi intrs muxed to one L1 intr */
+			irq = platform_get_irq(pdev, 0);
+		}
+
+		if (irq  >= 0) {
+			ret = devm_request_irq(&pdev->dev, irq,
+					       qspi_irq_tab[val].irq_handler, 0,
+					       name,
+					       &qspi->dev_ids[val]);
+			if (ret < 0) {
+				dev_err(&pdev->dev, "IRQ %s not found\n", name);
+				goto qspi_unprepare_err;
+			}
+
+			qspi->dev_ids[val].dev = qspi;
+			qspi->dev_ids[val].irqp = &qspi_irq_tab[val];
+			num_ints++;
+			dev_dbg(&pdev->dev, "registered IRQ %s %d\n",
+				qspi_irq_tab[val].irq_name,
+				irq);
+		}
+	}
+
+	if (!num_ints) {
+		dev_err(&pdev->dev, "no IRQs registered, cannot init driver\n");
+		ret = -EINVAL;
+		goto qspi_unprepare_err;
+	}
+
 	bcm_qspi_hw_init(qspi);
 	init_completion(&qspi->mspi_done);
 	init_completion(&qspi->bspi_done);
@@ -1662,7 +1710,7 @@ int bcm_qspi_probe(struct platform_device *pdev,
 	qspi->xfer_mode.addrlen = -1;
 	qspi->xfer_mode.hp = -1;
 
-	ret = devm_spi_register_master(&pdev->dev, master);
+	ret = spi_register_master(master);
 	if (ret < 0) {
 		dev_err(dev, "can't register master\n");
 		goto qspi_reg_err;
@@ -1672,11 +1720,10 @@ int bcm_qspi_probe(struct platform_device *pdev,
 
 qspi_reg_err:
 	bcm_qspi_hw_uninit(qspi);
+qspi_unprepare_err:
 	clk_disable_unprepare(qspi->clk);
 qspi_probe_err:
 	kfree(qspi->dev_ids);
-qspi_resource_err:
-	spi_master_put(master);
 	return ret;
 }
 /* probe function to be called by SoC specific platform driver probe */
@@ -1686,10 +1733,11 @@ int bcm_qspi_remove(struct platform_device *pdev)
 {
 	struct bcm_qspi *qspi = platform_get_drvdata(pdev);
 
+	platform_set_drvdata(pdev, NULL);
+	spi_unregister_master(qspi->master);
 	bcm_qspi_hw_uninit(qspi);
 	clk_disable_unprepare(qspi->clk);
 	kfree(qspi->dev_ids);
-	spi_unregister_master(qspi->master);
 
 	return 0;
 }

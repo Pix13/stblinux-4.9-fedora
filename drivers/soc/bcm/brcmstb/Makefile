@@ -1,4 +1,4 @@
-obj-y				+= common.o biuctrl.o
+obj-y				+= common.o biuctrl.o fdt_fixups.o
 obj-$(CONFIG_BRCMSTB_PM)	+= pm/
 
 obj-y				+= common.o biuctrl.o

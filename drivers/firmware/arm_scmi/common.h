@@ -10,6 +10,8 @@
 #include <linux/completion.h>
 #include <linux/device.h>
 #include <linux/errno.h>
+#include <linux/hashtable.h>
+#include <linux/list.h>
 #include <linux/kernel.h>
 #include <linux/scmi_protocol.h>
 #include <linux/types.h>
@@ -49,6 +51,16 @@ struct scmi_msg_resp_prot_version {
 	__le16 major_version;
 };
 
+/*
+ * Size of @pending_xfers hashtable included in @scmi_xfers_info; ideally, in
+ * order to minimize space and collisions, this should equal max_msg, i.e. the
+ * maximum number of in-flight messages on a specific platform, but such value
+ * is only available at runtime while kernel hashtables are statically sized:
+ * pick instead as a fixed static size the maximum number of entries that can
+ * fit the whole table into one 4k page.
+ */
+#define SCMI_PENDING_XFERS_HT_ORDER_SZ		9
+
 /**
  * struct scmi_msg_hdr - Message(Tx/Rx) header
  *
@@ -57,6 +69,9 @@ struct scmi_msg_resp_prot_version {
  * @seq: The token to identify the message. when a message/command returns,
  *       the platform returns the whole message header unmodified including
  *	 the token.
+ * @pending: True for xfers added to @pending_xfers hashtable
+ * @node: An hlist_node reference used to store this xfer, alternatively, on
+ *	  the free list @free_xfers or in the @pending_xfers hashtable
  */
 struct scmi_msg_hdr {
 	u8 id;
@@ -64,7 +79,24 @@ struct scmi_msg_hdr {
 	u16 seq;
 	u32 status;
 	bool poll_completion;
+	bool pending;
+	struct hlist_node node;
 };
+
+/*
+ * An helper macro to lookup an xfer from the @pending_xfers hashtable
+ * using the message sequence number token as a key.
+ */
+#define XFER_FIND(__ht, __k)					\
+({								\
+	typeof(__k) k_ = __k;					\
+	struct scmi_xfer *xfer_ = NULL;				\
+								\
+	hash_for_each_possible((__ht), xfer_, node, k_)		\
+		if (xfer_->hdr.seq == k_)			\
+			break;					\
+	xfer_;							\
+})
 
 /**
  * struct scmi_msg - Message(Tx/Rx) structure
@@ -80,6 +112,7 @@ struct scmi_msg {
 /**
  * struct scmi_xfer - Structure representing a message flow
  *
+ * @transfer_id: Unique ID for debug & profiling purpose
  * @hdr: Transmit message header
  * @tx: Transmit message
  * @rx: Receive message, the buffer should be pre-allocated to store
@@ -90,17 +123,20 @@ struct scmi_msg {
  * @defer_async_callback -- defer the callback via workqueue.
  * @work -- only used if async_agent_callback is non-NULL and
  *      defer_async_callback is true;
+ * @pending: True for xfers added to @pending_xfers hashtable
+ * @node: An hlist_node reference used to store this xfer, alternatively, on
+ *	  the free list @free_xfers or in the @pending_xfers hashtable
  */
 
 struct scmi_xfer {
+	int transfer_id;
 	void *con_priv;
 	struct scmi_msg_hdr hdr;
 	struct scmi_msg tx;
 	struct scmi_msg rx;
 	struct completion done;
-	scmi_cback_fn_t async_agent_callback;
-	bool defer_async_callback;
-	struct work_struct work;
+	bool pending;
+	struct hlist_node node;
 };
 
 void scmi_one_xfer_put(const struct scmi_handle *h, struct scmi_xfer *xfer);

@@ -17,6 +17,7 @@
 #include <linux/soc/brcmstb/brcmstb.h>
 #include <linux/brcmstb/brcmstb-smccc.h>
 #include <linux/reboot.h>
+#include <linux/kobject.h>
 
 #include <uapi/linux/psci.h>
 
@@ -27,6 +28,8 @@
 
 static psci_fn *invoke_psci_fn;
 static bool brcmstb_psci_system_reset2_supported;
+static bool brcmstb_psci_system_suspend_supported;
+static bool brcmstb_psci_cpu_retention = true;
 
 static int brcmstb_psci_integ_region(unsigned long function_id,
 				     unsigned long base,
@@ -149,6 +152,13 @@ static int psci_features(u32 psci_func_id)
 	return invoke_psci_fn(features_func_id, psci_func_id, 0, 0);
 }
 
+static int psci_suspend_finisher(unsigned long index)
+{
+	u32 pstate = index;
+
+	return psci_ops.cpu_suspend(pstate, __pa_symbol(cpu_resume));
+}
+
 static int brcmstb_psci_enter(suspend_state_t state)
 {
 	/* Request a SYSTEM level power state with retention */
@@ -158,10 +168,14 @@ static int brcmstb_psci_enter(suspend_state_t state)
 
 	switch (state) {
 	case PM_SUSPEND_STANDBY:
-		ret = psci_ops.cpu_suspend(pstate, 0);
+		if (brcmstb_psci_cpu_retention)
+			ret = psci_ops.cpu_suspend(pstate, 0);
+		else
+			ret = cpu_suspend(pstate, psci_suspend_finisher);
 		break;
 	case PM_SUSPEND_MEM:
-		ret = brcmstb_psci_system_mem_finish();
+		ret = brcmstb_psci_system_suspend_supported ?
+			brcmstb_psci_system_mem_finish() : -EINVAL;
 		break;
 	}
 
@@ -172,8 +186,9 @@ static int brcmstb_psci_valid(suspend_state_t state)
 {
 	switch (state) {
 	case PM_SUSPEND_STANDBY:
-	case PM_SUSPEND_MEM:
 		return true;
+	case PM_SUSPEND_MEM:
+		return brcmstb_psci_system_suspend_supported;
 	default:
 		return false;
 	}
@@ -199,6 +214,62 @@ static int brcmstb_psci_panic_notify(struct notifier_block *nb,
 static struct notifier_block brcmstb_psci_nb = {
 	.notifier_call = brcmstb_psci_panic_notify,
 };
+
+static ssize_t brcmstb_psci_version_show(struct kobject *kobj,
+					 struct kobj_attribute *attr,
+					 char *buf)
+{
+	struct arm_smccc_res res = { };
+	u32 version;
+
+	if (invoke_psci_fn == __invoke_psci_fn_hvc)
+		arm_smccc_hvc(SIP_FUNC_PSCI_BRCMSTB_VERSION,
+			      0, 0, 0, 0, 0, 0, 0, &res);
+	else
+		arm_smccc_smc(SIP_FUNC_PSCI_BRCMSTB_VERSION,
+			      0, 0, 0, 0, 0, 0, 0, &res);
+
+	if (res.a0 != PSCI_RET_SUCCESS)
+		return -EOPNOTSUPP;
+
+	version = res.a1;
+
+	return sprintf(buf, "%d.%d.%d.%d\n",
+		       (version >> 24) & 0xff, (version >> 16) & 0xff,
+		       (version >> 8) & 0xff, version & 0xff);
+}
+
+static struct kobj_attribute brcmstb_psci_version_attr =
+	__ATTR(brcmstb_mon_version, 0400, brcmstb_psci_version_show, NULL);
+
+static ssize_t brcmstb_psci_cpu_retention_show(struct kobject *kobj,
+					       struct kobj_attribute *attr,
+					       char *buf)
+{
+	return sprintf(buf, "%d\n", brcmstb_psci_cpu_retention);
+}
+
+static ssize_t brcmstb_psci_cpu_retention_store(struct kobject *kobj,
+						struct kobj_attribute *attr,
+						const char *buf, size_t count)
+{
+	int ret, val;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret < 0)
+		return ret;
+
+	if (val != 0 && val != 1)
+		return -EINVAL;
+
+	brcmstb_psci_cpu_retention = !!val;
+
+	return count;
+}
+
+static struct kobj_attribute brcmstb_psci_cpu_retention_attr =
+	__ATTR(brcmstb_cpu_retention, 0644, brcmstb_psci_cpu_retention_show,
+	       brcmstb_psci_cpu_retention_store);
 
 int brcmstb_pm_psci_init(void)
 {
@@ -245,6 +316,10 @@ int brcmstb_pm_psci_init(void)
 	if (ret != PSCI_RET_NOT_SUPPORTED)
 		brcmstb_psci_system_reset2_supported = true;
 
+	ret = psci_features(PSCI_FN_NATIVE(1_0, SYSTEM_SUSPEND));
+	if (ret != PSCI_RET_NOT_SUPPORTED)
+		brcmstb_psci_system_suspend_supported = true;
+
 	ret = brcmstb_psci_integ_region_reset_all();
 	if (ret != PSCI_RET_SUCCESS) {
 		pr_err("Error resetting all integrity checking regions\n");
@@ -269,6 +344,15 @@ int brcmstb_pm_psci_init(void)
 		return ret;
 
 	ret = brcmstb_regsave_init();
+	if (ret)
+		return ret;
+
+	ret = sysfs_create_file(firmware_kobj, &brcmstb_psci_version_attr.attr);
+	if (ret)
+		return ret;
+
+	ret = sysfs_create_file(firmware_kobj,
+				&brcmstb_psci_cpu_retention_attr.attr);
 	if (ret)
 		return ret;
 

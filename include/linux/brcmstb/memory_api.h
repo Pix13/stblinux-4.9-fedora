@@ -18,6 +18,8 @@
 #ifndef _BRCMSTB_MEMORY_API_H
 #define _BRCMSTB_MEMORY_API_H
 
+#include <linux/gfp.h>
+
 /*
  * Memory API that must be supplied for Broadcom STB middleware.
  *
@@ -114,10 +116,11 @@ static inline int brcmstb_memory_get(struct brcmstb_memory *mem)
 enum brcmstb_reserve_type {
 	BRCMSTB_RESERVE_BMEM,
 	BRCMSTB_RESERVE_CMA,
+	BRCMSTB_RESERVE_BHPA,
 };
 
 /* Determines what type of memory reservation will be used w/o CLI params */
-extern const enum brcmstb_reserve_type brcmstb_default_reserve;
+extern enum brcmstb_reserve_type brcmstb_default_reserve;
 /* Should be set to true by any CLI option that overrides default reserve */
 extern bool brcmstb_memory_override_defaults;
 /* May be set to true by any CLI option to convert bmem ranges to bhpa */
@@ -127,7 +130,13 @@ extern bool brcmstb_bmem_is_bhpa;
 int brcmstb_hugepage_alloc(unsigned int memcIndex, uint64_t *pages,
 			   unsigned int count, unsigned int *allocated,
 			   const struct brcmstb_range *range);
+int __brcmstb_hugepage_alloc(unsigned int memcIndex, uint64_t *pages,
+			     unsigned int count, unsigned int *allocated,
+			     const struct brcmstb_range *range, gfp_t flags);
 void brcmstb_hugepage_free(unsigned int memcIndex, const uint64_t *pages,
 			   unsigned int count);
+
+void __iomem *brcmstb_ioremap(phys_addr_t phys_addr, size_t size);
+void brcmstb_iounmap(volatile void __iomem *io_addr);
 
 #endif  /* _BRCMSTB_MEMORY_API_H */
